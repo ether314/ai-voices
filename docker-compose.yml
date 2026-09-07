@@ -1,0 +1,27 @@
+services:
+  voice-agent:
+    build: .
+    image: ai-voices:local
+    container_name: ai-voices
+    env_file:
+      - path: .env
+        required: false
+    environment:
+      # Override host Pulse when using a TCP bridge (see README).
+      PULSE_SERVER: ${PULSE_SERVER:-unix:/run/pulse/native}
+      # Cartesia / Cursor keys come from .env; optional overrides:
+      CARTESIA_VOICE_ID: ${CARTESIA_VOICE_ID:-d2b2c34b-bfd0-4c44-a85a-1d7ab8f3bbcc}
+      CURSOR_MODEL: ${CURSOR_MODEL:-composer-2.5}
+    stdin_open: true
+    tty: true
+    working_dir: /app
+    # Linux hosts with ALSA: uncomment to pass sound devices.
+    # devices:
+    #   - /dev/snd:/dev/snd
+    # group_add:
+    #   - audio
+    # Optional: PulseAudio / WSLg socket (see README). Do not bind-mount the
+    # project on Windows paths that contain spaces — the image already has the code.
+    # volumes:
+    #   - ${PULSE_RUNTIME_PATH:-/mnt/wslg/runtime-dir/pulse}:/run/pulse:ro
+    restart: "no"
