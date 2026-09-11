@@ -1,0 +1,9 @@
+HTTP/1.1 200 OK
+date: Tue, 08 Sep 2026 02:12:36 GMT
+server: uvicorn
+x-chatterbox-model: nano
+x-chatterbox-device: cpu
+x-chatterbox-voice: default
+content-length: 301518
+content-type: audio/wav
+

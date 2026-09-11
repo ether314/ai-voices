@@ -35,13 +35,25 @@ class InkSTT:
         self._recv_task: asyncio.Task[None] | None = None
         self._closed = asyncio.Event()
 
+    @property
+    def alive(self) -> bool:
+        return (
+            self._connection is not None
+            and not self._closed.is_set()
+            and self._recv_task is not None
+            and not self._recv_task.done()
+        )
+
     async def __aenter__(self) -> "InkSTT":
+        # Allow reuse after close() — previous reconnects left _closed set forever.
+        self._closed = asyncio.Event()
         self._connection = await self._client.stt.auto_finalize.websocket(
             encoding=self.encoding,
             model=self.model,
             sample_rate=self.sample_rate,
         ).__aenter__()
         self._recv_task = asyncio.create_task(self._receive_loop(), name="stt-receive")
+        print("[stt] websocket connected", flush=True)
         return self
 
     async def __aexit__(self, exc_type, exc, tb) -> None:  # noqa: ANN001
@@ -50,6 +62,10 @@ class InkSTT:
     async def send_audio(self, pcm: bytes) -> None:
         if self._connection is None or not pcm:
             return
+        if self._closed.is_set() or (
+            self._recv_task is not None and self._recv_task.done()
+        ):
+            raise ConnectionError("STT websocket is closed")
         await self._connection.send_raw(pcm)
 
     async def close(self) -> None:
@@ -73,20 +89,26 @@ class InkSTT:
             except Exception:
                 pass
             self._connection = None
+        print("[stt] websocket closed", flush=True)
 
     async def _receive_loop(self) -> None:
         assert self._connection is not None
-        async for event in self._connection:
-            etype = getattr(event, "type", None)
-            if etype == "turn.update":
-                transcript = getattr(event, "transcript", "") or ""
-                if self.on_partial is not None:
-                    await self.on_partial(transcript)
-            elif etype == "turn.end":
-                # Verbatim — do not strip/normalize (Cartesia STT pitfall).
-                transcript = getattr(event, "transcript", "") or ""
-                if self.on_turn_end is not None:
-                    await self.on_turn_end(transcript)
-            elif etype == "error":
-                message = getattr(event, "message", None) or str(event)
-                print(f"[stt] error: {message}", flush=True)
+        try:
+            async for event in self._connection:
+                etype = getattr(event, "type", None)
+                if etype == "turn.update":
+                    transcript = getattr(event, "transcript", "") or ""
+                    if self.on_partial is not None:
+                        await self.on_partial(transcript)
+                elif etype == "turn.end":
+                    # Verbatim — do not strip/normalize (Cartesia STT pitfall).
+                    transcript = getattr(event, "transcript", "") or ""
+                    if self.on_turn_end is not None:
+                        await self.on_turn_end(transcript)
+                elif etype == "error":
+                    message = getattr(event, "message", None) or str(event)
+                    print(f"[stt] error: {message}", flush=True)
+        except Exception as exc:  # noqa: BLE001
+            if not self._closed.is_set():
+                print(f"[stt] receive ended: {exc}", flush=True)
+        # Leave cleanup to close()/__aexit__; feed detects recv_task.done().

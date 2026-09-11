@@ -1,0 +1,73 @@
+# Chatterbox Nano (default) / Turbo local TTS + voice cloning
+#
+# Quick start (CPU — Nano is designed for this):
+#   cd chatterbox
+#   docker compose up -d --build
+#
+# GPU (large CUDA download on first build):
+#   docker compose --profile gpu up -d --build
+#
+# Switch model:
+#   set CHATTERBOX_MODEL=turbo
+#   docker compose up -d
+
+services:
+  # CPU: docker compose --profile cpu up -d
+  chatterbox:
+    profiles: ["cpu"]
+    build:
+      context: .
+      dockerfile: Dockerfile
+      args:
+        TORCH_INDEX: ${TORCH_INDEX:-https://download.pytorch.org/whl/cpu}
+    image: chatterbox-local:nano
+    container_name: chatterbox-local
+    ports:
+      - "${CHATTERBOX_PORT:-8090}:8090"
+    environment:
+      CHATTERBOX_MODEL: ${CHATTERBOX_MODEL:-nano}
+      CHATTERBOX_DEVICE: ${CHATTERBOX_DEVICE:-cpu}
+      HF_HOME: /cache/huggingface
+      HF_TOKEN: ${HF_TOKEN:-}
+      HUGGING_FACE_HUB_TOKEN: ${HF_TOKEN:-}
+      HF_HUB_DISABLE_XET: "1"
+      HF_HUB_ENABLE_HF_TRANSFER: "0"
+    env_file:
+      - path: .env
+        required: false
+    volumes:
+      - hf_cache:/cache/huggingface
+      - ./voices:/voices
+    restart: unless-stopped
+
+  # GPU: docker compose --profile gpu up -d --build
+  chatterbox-gpu:
+    profiles: ["gpu"]
+    build:
+      context: .
+      dockerfile: Dockerfile
+      args:
+        TORCH_INDEX: https://download.pytorch.org/whl/cu124
+    image: chatterbox-local:nano-gpu
+    container_name: chatterbox-local-gpu
+    ports:
+      - "${CHATTERBOX_PORT:-8090}:8090"
+    environment:
+      CHATTERBOX_MODEL: ${CHATTERBOX_MODEL:-nano}
+      CHATTERBOX_DEVICE: ${CHATTERBOX_DEVICE:-cuda}
+      HF_HOME: /cache/huggingface
+      HF_TOKEN: ${HF_TOKEN:-}
+      HUGGING_FACE_HUB_TOKEN: ${HF_TOKEN:-}
+      HF_HUB_DISABLE_XET: "1"
+      HF_HUB_ENABLE_HF_TRANSFER: "0"
+    env_file:
+      - path: .env
+        required: false
+    volumes:
+      - hf_cache:/cache/huggingface
+      - ./voices:/voices
+    gpus: all
+    restart: unless-stopped
+
+volumes:
+  hf_cache:

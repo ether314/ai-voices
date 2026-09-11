@@ -8,6 +8,9 @@ from dataclasses import asdict, dataclass
 from typing import Any, Literal
 
 
+from agent.expression import smart_append, strip_tags
+
+
 Role = Literal["you", "agent", "status", "error"]
 
 
@@ -55,28 +58,33 @@ class TranscriptHub:
                     else:
                         self._history.append(event)
             elif event.role == "agent" and event.partial:
-                if (
-                    self._history
-                    and self._history[-1].role == "agent"
-                    and self._history[-1].partial
-                ):
-                    prev = self._history[-1]
-                    self._history[-1] = TranscriptEvent(
-                        role="agent",
-                        text=prev.text + event.text,
-                        partial=True,
-                    )
-                    event = self._history[-1]
-                else:
+                replaced = False
+                for i in range(len(self._history) - 1, -1, -1):
+                    prev = self._history[i]
+                    if prev.role == "agent" and prev.partial:
+                        self._history[i] = TranscriptEvent(
+                            role="agent",
+                            text=smart_append(prev.text, event.text),
+                            partial=True,
+                        )
+                        event = self._history[i]
+                        replaced = True
+                        break
+                    if prev.role == "agent" and not prev.partial:
+                        break
+                if not replaced:
                     self._history.append(event)
             elif event.role == "agent" and not event.partial:
-                if (
-                    self._history
-                    and self._history[-1].role == "agent"
-                    and self._history[-1].partial
-                ):
-                    self._history[-1] = event
-                else:
+                replaced = False
+                for i in range(len(self._history) - 1, -1, -1):
+                    prev = self._history[i]
+                    if prev.role == "agent" and prev.partial:
+                        self._history[i] = event
+                        replaced = True
+                        break
+                    if prev.role == "agent" and not prev.partial:
+                        break
+                if not replaced:
                     self._history.append(event)
             else:
                 self._history.append(event)
@@ -140,16 +148,30 @@ class TranscriptHub:
         lines: list[str] = []
         for event in self._history:
             if event.role == "you":
-                label = "Caller/room"
-                lines.append(f"{label}: {event.text}")
+                # Interlocutor on the call — identity comes from Saved Context script.
+                lines.append(f"Caller/room: {event.text}")
             elif event.role == "agent":
-                lines.append(f"Joe: {event.text}")
+                lines.append(f"Joe: {strip_tags(event.text)}")
         live = self._live_you.strip()
         if live:
             # Avoid duplicating if the last history line already matches live partial.
             if not lines or not lines[-1].endswith(live):
                 lines.append(f"Caller/room (live): {live}")
         return "\n".join(lines)
+
+    async def clear(self) -> None:
+        """Wipe live transcript history (does not touch saved pinned context)."""
+        async with self._lock:
+            self._history.clear()
+            self._live_you = ""
+        event = TranscriptEvent(
+            role="status",
+            text="CONTEXT_CLEARED — cleared",
+        )
+        async with self._lock:
+            self._history.append(event)
+            for q in list(self._subscribers):
+                self._enqueue(q, event)
 
 
 hub = TranscriptHub()
