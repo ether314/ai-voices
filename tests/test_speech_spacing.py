@@ -351,6 +351,56 @@ def test_delivery_strip_normalize() -> None:
     assert "MagSafe" in strip_tags("DELIVERY: calm\nMag Safe is ready.")
 
 
+def test_cartesia_markup_preserved_for_tts() -> None:
+    from agent.expression import speech_for_tts
+
+    raw = (
+        '<emotion value="curious"/>Hmm, okay.<break time="200ms"/>'
+        "Your code is <spell>AB12</spell>. [laughter] Nice."
+    )
+    spoken = speech_for_tts(raw, backend="cartesia")
+    assert '<emotion value="curious"/>' in spoken
+    assert '<break time="200ms"/>' in spoken
+    assert "<spell>AB12</spell>" in spoken
+    assert "[laughter]" in spoken
+    caption = strip_tags(raw)
+    assert "emotion" not in caption.lower()
+    assert "break" not in caption.lower()
+    assert "spell" not in caption.lower()
+    assert "[laughter]" not in caption
+    assert "Your code is AB12" in caption
+    assert "Nice" in caption
+
+
+def test_cue_maps_to_cartesia() -> None:
+    from agent.expression import speech_for_tts
+
+    assert "[laughter]" in speech_for_tts("Okay [laugh] then.", backend="cartesia")
+    assert '<emotion value="affectionate"/>' in speech_for_tts(
+        "[warm] Hey there.", backend="cartesia"
+    )
+    local = speech_for_tts(
+        '<emotion value="calm"/>Wait.<break time="300ms"/>[laughter] Sure.',
+        backend="local",
+    )
+    assert "<emotion" not in local
+    assert "<break" not in local
+    assert "[laugh]" in local
+    assert "Wait" in local
+
+
+def test_ssml_not_split_by_smart_append() -> None:
+    from agent.expression import should_flush_phrase
+
+    buf = ""
+    for piece in ["Hello.", "<bre", 'ak time="200ms"/>', "Next."]:
+        buf = smart_append(buf, piece)
+    assert '<break time="200ms"/>' in buf
+    # Incomplete tag must not flush.
+    mid = smart_append("Hello ", "<bre")
+    assert not should_flush_phrase(mid, first=True)
+
+
 if __name__ == "__main__":
     tests = [
         test_magsafe_sentence,
@@ -378,6 +428,9 @@ if __name__ == "__main__":
         test_magsafe_char_stream,
         test_plural_brands_stable,
         test_delivery_strip_normalize,
+        test_cartesia_markup_preserved_for_tts,
+        test_cue_maps_to_cartesia,
+        test_ssml_not_split_by_smart_append,
     ]
     failed = 0
     for fn in tests:

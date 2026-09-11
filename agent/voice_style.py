@@ -151,7 +151,9 @@ def choices_payload() -> dict[str, Any]:
         "speeds": [dict(c) for c in SPEED_CHOICES],
         "tonalities": [dict(c) for c in TONALITY_CHOICES],
         "hint": (
-            "Cartesia: Sonic generation_config speed + emotion. "
-            "Local: temperature (+ exaggeration if supported) and time-stretch speed."
+            "Cartesia: Sonic generation_config speed + emotion (UI baseline), "
+            "plus inline SSML / [laughter] from the LLM when present. "
+            "Local: temperature (+ exaggeration if supported) and time-stretch speed; "
+            "Cartesia SSML is adapted or stripped."
         ),
     }

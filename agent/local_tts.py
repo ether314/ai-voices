@@ -14,7 +14,7 @@ import aiohttp
 import numpy as np
 
 from agent.audio import SAMPLE_RATE, _resample_mono
-from agent.expression import normalize_speech_for_tts, should_flush_phrase, smart_append
+from agent.expression import should_flush_phrase, smart_append, speech_for_tts
 from agent.voice_style import DEFAULT_SPEED, DEFAULT_TONALITY, local_tts_params
 
 OnAudioChunk = Callable[[bytes], Awaitable[None]]
@@ -190,12 +190,13 @@ class ChatterboxTTS:
                         break
                     if piece:
                         joined = smart_append(joined, piece)
-                    spaced = normalize_speech_for_tts(joined)
-                    if _should_flush(spaced, first=first):
-                        await phrase_q.put(spaced.strip())
+                    if _should_flush(joined, first=first):
+                        phrase = speech_for_tts(joined, backend="local")
+                        if phrase:
+                            await phrase_q.put(phrase)
                         joined = ""
                         first = False
-                leftover = normalize_speech_for_tts(joined).strip()
+                leftover = speech_for_tts(joined, backend="local")
                 if leftover and not _stop():
                     await phrase_q.put(leftover)
             finally:
@@ -209,8 +210,8 @@ class ChatterboxTTS:
                         break
                     if _stop():
                         break
-                    # Last gate before GPU synth — spacing must be clean.
-                    phrase = normalize_speech_for_tts(phrase).strip()
+                    # Last gate before GPU synth — adapt Cartesia markup / spacing.
+                    phrase = speech_for_tts(phrase, backend="local")
                     if not phrase:
                         continue
                     pcm = await self._synth_pcm(phrase, should_stop=should_stop)

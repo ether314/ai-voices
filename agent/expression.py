@@ -41,13 +41,133 @@ DELIVERY_LINE_RE = re.compile(
 )
 TAG_LIST_FOR_PROMPT = ", ".join(f"[{t}]" for t in CHATTERBOX_TAGS)
 
+# --- Cartesia Sonic paralinguistics (native SSML + [laughter]) ---
+# Docs: capability-guides/ssml-tags + volume-speed-emotion + prompting-tips.
+CARTESIA_LAUGHTER = "[laughter]"
+CARTESIA_EMOTIONS: frozenset[str] = frozenset(
+    {
+        "neutral",
+        "happy",
+        "excited",
+        "enthusiastic",
+        "elated",
+        "euphoric",
+        "triumphant",
+        "amazed",
+        "surprised",
+        "flirtatious",
+        "curious",
+        "content",
+        "peaceful",
+        "serene",
+        "calm",
+        "grateful",
+        "affectionate",
+        "trust",
+        "sympathetic",
+        "anticipation",
+        "mysterious",
+        "angry",
+        "mad",
+        "outraged",
+        "frustrated",
+        "agitated",
+        "threatened",
+        "disgusted",
+        "contempt",
+        "envious",
+        "sarcastic",
+        "ironic",
+        "sad",
+        "dejected",
+        "melancholic",
+        "disappointed",
+        "hurt",
+        "guilty",
+        "bored",
+        "tired",
+        "rejected",
+        "nostalgic",
+        "wistful",
+        "apologetic",
+        "hesitant",
+        "insecure",
+        "confused",
+        "resigned",
+        "anxious",
+        "panicked",
+        "alarmed",
+        "scared",
+        "proud",
+        "confident",
+        "distant",
+        "skeptical",
+        "contemplative",
+        "determined",
+    }
+)
+# Prefer these in LLM prompts (primary + a few high-utility mid-tier).
+CARTESIA_PROMPT_EMOTIONS: tuple[str, ...] = (
+    "calm",
+    "curious",
+    "happy",
+    "affectionate",
+    "sympathetic",
+    "contemplative",
+    "determined",
+    "hesitant",
+    "sarcastic",
+    "content",
+    "excited",
+)
+# Lightweight cue → Cartesia native (LLM may emit either form).
+_CUE_TO_CARTESIA: dict[str, str] = {
+    "laughter": CARTESIA_LAUGHTER,
+    "laugh": CARTESIA_LAUGHTER,
+    "chuckle": CARTESIA_LAUGHTER,
+    "warm": '<emotion value="affectionate"/>',
+    "calm": '<emotion value="calm"/>',
+    "curious": '<emotion value="curious"/>',
+    "amused": '<emotion value="happy"/>',
+    "happy": '<emotion value="happy"/>',
+    "cheerful": '<emotion value="happy"/>',
+    "serious": '<emotion value="contemplative"/>',
+    "thoughtful": '<emotion value="contemplative"/>',
+    "firm": '<emotion value="determined"/>',
+    "determined": '<emotion value="determined"/>',
+    "hesitant": '<emotion value="hesitant"/>',
+    "sympathetic": '<emotion value="sympathetic"/>',
+    "sorry": '<emotion value="apologetic"/>',
+    "confident": '<emotion value="confident"/>',
+    "excited": '<emotion value="excited"/>',
+    "sarcastic": '<emotion value="sarcastic"/>',
+}
+_SSML_VOID_RE = re.compile(
+    r"<\s*(break|emotion|speed|volume)\b[^>]*?/?>",
+    re.IGNORECASE,
+)
+_SSML_SPELL_RE = re.compile(
+    r"<\s*spell\b[^>]*>.*?</\s*spell\s*>",
+    re.IGNORECASE | re.DOTALL,
+)
+_SSML_EMOTION_RE = re.compile(
+    r"<\s*emotion\b([^>]*)/?>",
+    re.IGNORECASE,
+)
+_BRACKET_CUE_RE = re.compile(r"\[([^\]]{1,40})\]")
+_BREAK_TIME_RE = re.compile(
+    r"<\s*break\b[^>]*\btime\s*=\s*[\"']?(\d+(?:\.\d+)?)(ms|s)?[\"']?[^>]*/?>",
+    re.IGNORECASE,
+)
+
 # Alphabetic runs that may be missing spaces (wordninja is safe on real words).
 _GLUED_RUN_RE = re.compile(r"[A-Za-z]{5,}")
 # Straight + curly apostrophes.
 _APOS = "'’‘"
-# Split tokens while leaving punctuation / tags alone.
+# Split tokens while leaving punctuation / tags / SSML alone.
 _SPEECH_TOKEN_RE = re.compile(
-    rf"\[[^\]]*\]|[A-Za-z]+(?:[{_APOS}][A-Za-z]+)?|[^A-Za-z\[]+"
+    rf"\[[^\]]*\]|</?[A-Za-z][^>\s]*(?:\s[^>]*)?>|"
+    rf"[A-Za-z]+(?:[{_APOS}][A-Za-z]+)?|[^A-Za-z\[<]+"
 )
 # Two words that may be a single word falsely split by the streamer ("sharp ens").
 _FALSE_SPLIT_RE = re.compile(r"\b([A-Za-z]{2,})\s+([a-zA-Z]{2,6})\b")
@@ -187,20 +307,50 @@ _BRAND_SPACE_FIXES: tuple[tuple[re.Pattern[str], str], ...] = (
 )
 
 
+def _markup_incomplete(text: str) -> bool:
+    """True while a bracket tag or SSML element is still open (do not flush/split)."""
+    if not text:
+        return False
+    if text.rfind("[") > text.rfind("]"):
+        return True
+    if text.rfind("<") > text.rfind(">"):
+        return True
+    low = text.lower()
+    # <spell>…</spell> may span chunks after the opening '>' is closed.
+    if low.count("<spell") > low.count("</spell>"):
+        return True
+    return False
+
+
+def _visible_speech_len(text: str) -> int:
+    """Approx spoken length for flush thresholds (ignore markup)."""
+    if not text:
+        return 0
+    stripped = _SSML_SPELL_RE.sub(lambda m: re.sub(r"<[^>]+>", "", m.group(0)), text)
+    stripped = _SSML_VOID_RE.sub("", stripped)
+    stripped = _BRACKET_CUE_RE.sub("", stripped)
+    return len(re.sub(r"\s+", " ", stripped).strip())
+
+
 def should_flush_phrase(text: str, *, first: bool) -> bool:
     """Flush early on the first phrase so audio can start before the LLM finishes."""
     s = text.rstrip()
     if not s:
         return False
-    min_sent = 16 if first else 24
-    hard_cap = 52 if first else 110
-    if len(s) < min_sent:
+    # Never flush mid-tag / mid-SSML — Cartesia needs complete tags.
+    if _markup_incomplete(s):
         return False
-    if s[-1] in ".!?…" and len(s) >= min_sent:
+    # First phrase: start Sonic ASAP (~10–12 chars). Later phrases stay steadier.
+    min_sent = 11 if first else 24
+    hard_cap = 42 if first else 110
+    vis = _visible_speech_len(s)
+    if vis < min_sent and len(s) < hard_cap:
+        return False
+    if s[-1] in ".!?…" and vis >= min_sent:
         return True
-    if first and s[-1] in ",;:" and len(s) >= 28:
+    if first and s[-1] in ",;:" and vis >= 18:
         return True
-    if len(s) >= hard_cap:
+    if vis >= hard_cap or len(s) >= hard_cap + 40:
         return True
     return False
 
@@ -212,7 +362,7 @@ def smart_append(buf: str, chunk: str) -> str:
     next token (ens+your). We only:
       - preserve explicit whitespace from the model,
       - space after punctuation,
-      - never touch text inside an open [tag].
+      - never touch text inside an open [tag] or SSML element.
     All other spacing is repaired in normalize_speech_for_tts().
     """
     if not chunk:
@@ -220,8 +370,8 @@ def smart_append(buf: str, chunk: str) -> str:
     if not buf:
         return chunk
 
-    # Preserve bracket tags: "[ch" + "uckle]" must not become "[ch uckle]"
-    if buf.rfind("[") > buf.rfind("]"):
+    # Preserve bracket tags / SSML: "[ch"+"uckle]", "<bre"+"ak …/>", "<spell>A"+"BC</spell>"
+    if _markup_incomplete(buf):
         return buf + chunk
 
     # Model already sent a leading space / newline — trust it.
@@ -229,6 +379,10 @@ def smart_append(buf: str, chunk: str) -> str:
         return buf + chunk
 
     left = buf[-1]
+
+    # Keep SSML glued to adjacent text (Cartesia: tags need no surrounding spaces).
+    if chunk[0] == "<" or left == ">":
+        return buf + chunk
 
     # Contraction / possessive fragments stay attached: "I" + "'m", "'" + "s"
     if left.isalnum() and chunk[0] in "'’":
@@ -510,29 +664,63 @@ def repair_tag_spacing(text: str) -> str:
         inner = match.group(1)
         compact = re.sub(r"\s+", "", inner).lower()
         spaced = re.sub(r"\s+", " ", inner.strip()).lower()
+        if compact == "laughter":
+            return CARTESIA_LAUGHTER
         for tag in CHATTERBOX_TAGS:
             tag_compact = tag.replace(" ", "").lower()
             if compact == tag_compact or spaced == tag.lower():
                 return f"[{tag}]"
+        # Known Cartesia cue shorthands (warm, calm, …).
+        if compact in _CUE_TO_CARTESIA:
+            return f"[{compact}]"
         return match.group(0)
 
     return re.sub(r"\[([^\]]+)\]", _fix, text)
 
 
+def _protect_markup(text: str) -> tuple[str, list[str]]:
+    """Replace complete markup spans with placeholders so spacing repair can't break them."""
+    held: list[str] = []
+
+    def _hold(match: re.Match[str]) -> str:
+        held.append(match.group(0))
+        return f"\x00M{len(held) - 1}\x00"
+
+    # Longer / more specific first: spell blocks, void SSML, brackets.
+    out = _SSML_SPELL_RE.sub(_hold, text)
+    out = _SSML_VOID_RE.sub(_hold, out)
+    out = _BRACKET_CUE_RE.sub(_hold, out)
+    return out, held
+
+
+def _restore_markup(text: str, held: list[str]) -> str:
+    if not held:
+        return text
+
+    def _put(match: re.Match[str]) -> str:
+        idx = int(match.group(1))
+        if 0 <= idx < len(held):
+            return held[idx]
+        return ""
+
+    return re.sub(r"\x00M(\d+)\x00", _put, text)
+
+
 def ensure_speech_spacing(text: str) -> str:
-    """Light structural spacing fixes (punct, camelCase)."""
+    """Light structural spacing fixes (punct, camelCase). Preserves markup."""
     if not text:
         return text
     text = repair_tag_spacing(text)
-    text = re.sub(r"([,.;:!?])([A-Za-z0-9\"'“‘])", r"\1 \2", text)
-    text = re.sub(r"([a-z])([A-Z])", r"\1 \2", text)
+    protected, held = _protect_markup(text)
+    protected = re.sub(r"([,.;:!?])([A-Za-z0-9\"'“‘])", r"\1 \2", protected)
+    protected = re.sub(r"([a-z])([A-Z])", r"\1 \2", protected)
     # Single-letter BPE breaks: "L osing" -> "Losing" (keep "I fixed" / "A day").
     # Leading-I glued words (Ifixed / Imagine) are handled in _unglue_run — do not
     # blindly insert a space after capital I (that turns Imagine into I magine).
-    text = re.sub(r"\b([B-HJ-Z]) ([a-z]{2,})\b", r"\1\2", text)
-    text = re.sub(r"\b([b-hj-z]) ([a-z]{2,})\b", r"\1\2", text)
-    text = re.sub(r" {2,}", " ", text)
-    return text
+    protected = re.sub(r"\b([B-HJ-Z]) ([a-z]{2,})\b", r"\1\2", protected)
+    protected = re.sub(r"\b([b-hj-z]) ([a-z]{2,})\b", r"\1\2", protected)
+    protected = re.sub(r" {2,}", " ", protected)
+    return _restore_markup(protected, held)
 
 
 def _unglue_token(tok: str) -> str:
@@ -557,6 +745,7 @@ def _unglue_token(tok: str) -> str:
 def normalize_speech_for_tts(text: str) -> str:
     """Hard gate before audio: merge false splits, unglue compounds, tidy spaces.
 
+    Preserves complete Cartesia SSML / [laughter] / cue brackets.
     This is the authoritative spacing pass. Call it on every phrase before synth.
     """
     if not text or not text.strip():
@@ -565,12 +754,13 @@ def normalize_speech_for_tts(text: str) -> str:
 
     text = ensure_speech_spacing(text)
     text = repair_tag_spacing(text)
-    text = _apply_brand_space_fixes(text)
+    protected, held = _protect_markup(text)
+    protected = _apply_brand_space_fixes(protected)
 
     # 1) Unglue each alphabetic token ("ownvoice", "ensyour", "redflag").
     pieces: list[str] = []
-    for tok in _SPEECH_TOKEN_RE.findall(text):
-        if tok.startswith("["):
+    for tok in _SPEECH_TOKEN_RE.findall(protected):
+        if tok.startswith("\x00M") or tok.startswith("[") or tok.startswith("<"):
             pieces.append(tok)
         elif tok.isalpha() or (
             len(tok) > 2 and re.sub(rf"[{_APOS}]", "", tok).isalpha()
@@ -578,19 +768,20 @@ def normalize_speech_for_tts(text: str) -> str:
             pieces.append(_unglue_token(tok))
         else:
             pieces.append(tok)
-    text = "".join(pieces)
+    protected = "".join(pieces)
 
     # 2) Rejoin false mid-word spaces ("sharp ens" -> "sharpens").
-    text = _repair_broken_I_words(text)
-    text = _merge_false_splits(text)
-    text = _apply_brand_space_fixes(text)
+    protected = _repair_broken_I_words(protected)
+    protected = _merge_false_splits(protected)
+    protected = _apply_brand_space_fixes(protected)
 
     # 3) Another unglue + merge pass for leftovers.
-    text = _GLUED_RUN_RE.sub(lambda m: _unglue_run(m.group(0)), text)
-    text = _repair_broken_I_words(text)
-    text = _merge_false_splits(text)
-    text = _apply_brand_space_fixes(text)
+    protected = _GLUED_RUN_RE.sub(lambda m: _unglue_run(m.group(0)), protected)
+    protected = _repair_broken_I_words(protected)
+    protected = _merge_false_splits(protected)
+    protected = _apply_brand_space_fixes(protected)
 
+    text = _restore_markup(protected, held)
     text = repair_tag_spacing(text)
     text = re.sub(r" {2,}", " ", text)
     text = re.sub(r"\s+([,.;:!?])", r"\1", text)
@@ -603,6 +794,15 @@ def normalize_speech_for_tts(text: str) -> str:
 def sanitize_delivery_header(text: str) -> str:
     """Fix 'DEL IVERY' corruption from bad spacing inserts."""
     return re.sub(r"\bD\s*E\s*L\s*I\s*V\s*E\s*R\s*Y\s*:", "DELIVERY:", text, flags=re.I)
+
+
+def _strip_delivery(text: str) -> str:
+    return re.sub(
+        r"^\s*DELIVERY\s*:.*(?:\n|$)",
+        "",
+        text or "",
+        flags=re.IGNORECASE | re.MULTILINE,
+    )
 
 
 @dataclass
@@ -618,15 +818,19 @@ class ExpressionState:
 
 
 def strip_tags(text: str) -> str:
-    """Remove tags / DELIVERY headers; normalize spacing for captions + TTS."""
-    cleaned = text or ""
-    cleaned = re.sub(
-        r"^\s*DELIVERY\s*:.*(?:\n|$)", "", cleaned, flags=re.IGNORECASE | re.MULTILINE
-    )
+    """Remove SSML / cues / DELIVERY for captions + transcript (spoken words only)."""
+    cleaned = _strip_delivery(text or "")
     cleaned = repair_tag_spacing(cleaned)
+    # Keep spell contents; drop void SSML; drop bracket cues / laughter.
+    cleaned = _SSML_SPELL_RE.sub(
+        lambda m: re.sub(r"</?spell\b[^>]*>", "", m.group(0), flags=re.I), cleaned
+    )
+    cleaned = _SSML_VOID_RE.sub("", cleaned)
     cleaned = TAG_RE.sub("", cleaned)
-    # Drop any leftover bracket junk (legacy emotion tags).
+    cleaned = re.sub(r"\[laughter\]", "", cleaned, flags=re.IGNORECASE)
     cleaned = re.sub(r"\[[^\]]{0,40}\]", "", cleaned)
+    # Drop any leftover raw angle markup the model invented.
+    cleaned = re.sub(r"</?[A-Za-z][^>]*>", "", cleaned)
     cleaned = normalize_speech_for_tts(cleaned)
     return re.sub(r" {2,}", " ", cleaned).strip()
 
@@ -641,10 +845,102 @@ def extract_tags(text: str) -> list[str]:
     return found
 
 
+def _sanitize_emotion_tag(match: re.Match[str]) -> str:
+    attrs = match.group(1) or ""
+    val_m = re.search(r"value\s*=\s*[\"']?([A-Za-z_]+)[\"']?", attrs, re.I)
+    if not val_m:
+        return ""
+    value = val_m.group(1).lower()
+    aliases = {
+        "warm": "affectionate",
+        "amused": "happy",
+        "cheerful": "happy",
+        "serious": "contemplative",
+        "thoughtful": "contemplative",
+        "firm": "determined",
+        "sorry": "apologetic",
+    }
+    value = aliases.get(value, value)
+    if value not in CARTESIA_EMOTIONS:
+        return ""
+    return f'<emotion value="{value}"/>'
+
+
+def _map_cues_for_cartesia(text: str) -> str:
+    """Map shorthand [warm]/[laugh] → Sonic SSML / [laughter]; drop unknown brackets."""
+
+    def _cue(match: re.Match[str]) -> str:
+        inner = re.sub(r"\s+", " ", match.group(1).strip()).lower()
+        compact = inner.replace(" ", "")
+        if compact == "laughter" or inner == "laughter":
+            return CARTESIA_LAUGHTER
+        mapped = _CUE_TO_CARTESIA.get(compact) or _CUE_TO_CARTESIA.get(inner)
+        if mapped:
+            return mapped
+        if inner in {t.lower() for t in CHATTERBOX_TAGS}:
+            return ""
+        return ""
+
+    out = repair_tag_spacing(text)
+    out = _SSML_EMOTION_RE.sub(_sanitize_emotion_tag, out)
+    out = _BRACKET_CUE_RE.sub(_cue, out)
+    return out
+
+
+def _map_for_local(text: str) -> str:
+    """Best-effort local path: keep Chatterbox tags, strip/adapt Cartesia SSML."""
+
+    def _break_to_pause(match: re.Match[str]) -> str:
+        raw = match.group(1)
+        unit = (match.group(2) or "ms").lower()
+        try:
+            amount = float(raw)
+        except ValueError:
+            return "... "
+        ms = amount * 1000.0 if unit == "s" else amount
+        if ms >= 450:
+            return "... "
+        if ms >= 180:
+            return ", "
+        return " "
+
+    out = repair_tag_spacing(text)
+    out = re.sub(r"\[laughter\]", "[laugh]", out, flags=re.IGNORECASE)
+    out = _BREAK_TIME_RE.sub(_break_to_pause, out)
+    out = _SSML_SPELL_RE.sub(
+        lambda m: re.sub(r"</?spell\b[^>]*>", "", m.group(0), flags=re.I), out
+    )
+    out = re.sub(r"<\s*(emotion|speed|volume)\b[^>]*?/?>", "", out, flags=re.I)
+
+    def _local_cue(match: re.Match[str]) -> str:
+        inner = re.sub(r"\s+", " ", match.group(1).strip()).lower()
+        compact = inner.replace(" ", "")
+        if compact in {"laugh", "laughter", "chuckle"}:
+            return "[laugh]"
+        for tag in CHATTERBOX_TAGS:
+            if tag.lower() == inner or tag.replace(" ", "") == compact:
+                return f"[{tag}]"
+        return ""
+
+    out = _BRACKET_CUE_RE.sub(_local_cue, out)
+    out = re.sub(r"</?[A-Za-z][^>]*>", "", out)
+    return out
+
+
 def speech_for_tts(text: str, *, backend: str = "") -> str:
-    """Normalize speech for any TTS backend (no emotion tags)."""
-    del backend  # kept for call-site compatibility
-    return strip_tags(text)
+    """Prepare spoken text for a TTS backend (Cartesia keeps SSML; local adapts/strips)."""
+    cleaned = _strip_delivery(text or "")
+    cleaned = sanitize_delivery_header(cleaned)
+    cleaned = DELIVERY_LINE_RE.sub("", cleaned)
+    backend = (backend or "").strip().lower()
+    if backend in {"local", "chatterbox"}:
+        cleaned = _map_for_local(cleaned)
+        cleaned = normalize_speech_for_tts(cleaned)
+        return cleaned.strip()
+    # Default / Cartesia Sonic: preserve native markup.
+    cleaned = _map_cues_for_cartesia(cleaned)
+    cleaned = normalize_speech_for_tts(cleaned)
+    return cleaned.strip()
 
 
 @dataclass
@@ -792,19 +1088,27 @@ class ExpressionStreamParser:
         return out
 
 
-def expression_prompt_block() -> str:
+def cartesia_paralinguistics_prompt_block() -> str:
+    """Instructions for Cursor/local LLM to emit Sonic-native human signals."""
+    emotions = ", ".join(CARTESIA_PROMPT_EMOTIONS)
     return (
-        "Emotional delivery (required format):\n"
-        "1) First line MUST be exactly: DELIVERY: <short tone phrase>\n"
-        "   Pick a tone that fits the call context — e.g. warm coaching, calm urgency, "
-        "curious probe, light humor, firm redirect, empathetic support.\n"
-        "2) Then speak 2–4 short sentences. Start with one short sentence.\n"
-        "3) Optionally embed at most 1–2 paralinguistic tags from this allowlist when "
-        "they feel natural (do not overuse):\n"
-        f"   {TAG_LIST_FOR_PROMPT}\n"
-        "   Prefer emotion tags like [happy]/[sigh]/[chuckle] that match the DELIVERY tone "
-        "and the transcript. Never invent tags outside the allowlist.\n"
-        "4) Do not explain the tags. Do not use markdown. Spoken words only after DELIVERY.\n"
-        "5) Spacing matters: put a normal space between every word. "
-        "Never concatenate words.\n"
+        "Sound human — not monotone or scripted. Use short clauses, natural punctuation, "
+        "and occasional soft hesitations written as words (uh, um, hmm, I mean, well…) "
+        "when they fit. Match energy to the scenario (warm, amused, thoughtful, firm) "
+        "without becoming cartoonish.\n"
+        "Cartesia Sonic markup (embed inline; never narrate stage directions aloud):\n"
+        f"- [laughter] for a real laugh when it fits\n"
+        "- <break time=\"200ms\"/> or \"300ms\" rarely for a deliberate beat "
+        "(prefer commas/periods; never stack breaks)\n"
+        f"- <emotion value=\"…\"/> at most once per turn when tone clearly shifts; "
+        f"prefer: {emotions}\n"
+        "- <spell>CODE</spell> only for IDs/codes that must be spelled character-by-character\n"
+        "Optional shorthand also OK (mapped for Sonic): [warm] [calm] [curious] [amused] "
+        "[serious] [firm] [hesitant] [laugh].\n"
+        "Do NOT write DELIVERY headers, markdown, lists, or phrases like \"he laughs\".\n"
     )
+
+
+def expression_prompt_block() -> str:
+    """Legacy Chatterbox-oriented block; prefer cartesia_paralinguistics_prompt_block."""
+    return cartesia_paralinguistics_prompt_block()

@@ -1,6 +1,6 @@
 # Local mic voice agent
 
-Speak into your PC mic → live transcript (Cartesia **Ink-2**) → reply (Cursor **composer-2.5**) → spoken aloud (Cartesia **Sonic**, Joe Marazzo voice).
+Speak into your PC mic → live transcript (Cartesia **Ink-2**) → reply (Cursor **composer-2.5**) → spoken aloud (Cartesia **Sonic**, Jack voice).
 
 ## Quick start (Docker — recommended)
 
@@ -106,7 +106,7 @@ Optional `.env` overrides:
 
 | Variable | Default | Purpose |
 |---|---|---|
-| `CARTESIA_VOICE_ID` | Joe Marazzo `d2b2c34b-bfd0-4c44-a85a-1d7ab8f3bbcc` | TTS voice |
+| `CARTESIA_VOICE_ID` | Jack `7e94372f-47be-42b7-ba88-1c1f463da123` (Joe: `55e8e671-7e46-4a15-9b53-4955c92aec0c`) | TTS voice; UI lists all Cartesia voices from the API |
 | `CURSOR_MODEL` | `composer-2.5` | Cursor agent model |
 | `AUDIO_INPUT_DEVICE` | system default | Mic device index |
 | `AUDIO_OUTPUT_DEVICE` | system default | Speaker device index |

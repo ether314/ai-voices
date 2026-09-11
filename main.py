@@ -1,4 +1,4 @@
-"""Local mic voice agent: Cartesia STT/TTS + Cursor Composer."""
+"""Local mic voice agent: Cartesia STT/TTS + Cursor / local LLM."""
 
 from __future__ import annotations
 
@@ -9,8 +9,9 @@ from pathlib import Path
 
 from dotenv import load_dotenv
 
+from agent.llm import DEFAULT_MODEL as DEFAULT_CURSOR_MODEL, resolve_cursor_runtime
 from agent.session import VoiceSession
-from agent.tts import DEFAULT_VOICE_ID
+from agent.tts import DEFAULT_VOICE_ID, resolve_cartesia_voice_id
 from agent.ui import start_ui
 
 
@@ -29,10 +30,16 @@ async def _amain() -> None:
     load_dotenv()
     cartesia_key = _require_env("CARTESIA_API_KEY")
     cursor_key = _require_env("CURSOR_API_KEY")
-    voice_id = os.getenv("CARTESIA_VOICE_ID", DEFAULT_VOICE_ID).strip() or DEFAULT_VOICE_ID
-    model = os.getenv("CURSOR_MODEL", "gpt-5.6-luna").strip() or "gpt-5.6-luna"
+    voice_id = resolve_cartesia_voice_id(
+        os.getenv("CARTESIA_VOICE_ID", DEFAULT_VOICE_ID) or DEFAULT_VOICE_ID
+    )
+    model = (
+        os.getenv("CURSOR_MODEL", DEFAULT_CURSOR_MODEL).strip() or DEFAULT_CURSOR_MODEL
+    )
+    cursor_runtime = resolve_cursor_runtime()
     cwd = str(Path(__file__).resolve().parent)
     print(f"Cursor model: {model}", flush=True)
+    print(f"Cursor runtime: {cursor_runtime}", flush=True)
 
     session = VoiceSession(
         cartesia_api_key=cartesia_key,
@@ -68,6 +75,8 @@ async def _amain() -> None:
         set_context=session.set_pinned_context,
         get_tts=session.get_tts_settings,
         set_tts=session.set_tts_settings,
+        get_llm=session.get_llm_settings,
+        set_llm=session.set_llm_settings,
         get_devices=session.get_audio_devices,
         set_input=session.set_input_device,
         set_output=session.set_output_device,

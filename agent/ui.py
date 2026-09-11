@@ -14,6 +14,8 @@ ContextGetter = Callable[[], Awaitable[dict[str, Any]]]
 ContextSetter = Callable[[str], Awaitable[dict[str, Any]]]
 TtsGetter = Callable[[], Awaitable[dict[str, Any]]]
 TtsSetter = Callable[..., Awaitable[dict[str, Any]]]
+LlmGetter = Callable[[], Awaitable[dict[str, Any]]]
+LlmSetter = Callable[..., Awaitable[dict[str, Any]]]
 
 HTML = """<!DOCTYPE html>
 <html lang="en">
@@ -268,7 +270,8 @@ HTML = """<!DOCTYPE html>
       padding: 0.65rem 0.75rem;
       font-size: 0.9rem;
     }
-    .devices input[type="url"] {
+    .devices input[type="url"],
+    .devices input[type="text"] {
       width: 100%;
       box-sizing: border-box;
       background: var(--panel);
@@ -290,6 +293,21 @@ HTML = """<!DOCTYPE html>
     }
     #applyTts:hover { filter: brightness(1.08); }
     #ttsHint {
+      font-size: 0.75rem;
+      color: var(--muted);
+    }
+    #applyLlm {
+      border: none;
+      border-radius: 999px;
+      padding: 0.65rem 1.1rem;
+      font-size: 0.85rem;
+      font-weight: 700;
+      cursor: pointer;
+      background: #334155;
+      color: #f8fafc;
+    }
+    #applyLlm:hover { filter: brightness(1.08); }
+    #llmHint {
       font-size: 0.75rem;
       color: var(--muted);
     }
@@ -387,6 +405,29 @@ HTML = """<!DOCTYPE html>
       </div>
       <div class="devices" style="margin-top:0.65rem">
         <div>
+          <label for="llmBackend">Reply model</label>
+          <select id="llmBackend">
+            <option value="cursor">Cursor local (composer-2.5)</option>
+            <option value="local">Local (OpenAI-compatible)</option>
+          </select>
+        </div>
+        <div>
+          <label for="localLlmModel">Local model name</label>
+          <input id="localLlmModel" type="text" value="llama3.2" />
+        </div>
+      </div>
+      <div class="devices" style="margin-top:0.65rem">
+        <div>
+          <label for="localLlmUrl">Local LLM URL</label>
+          <input id="localLlmUrl" type="url" value="http://127.0.0.1:11434/v1" />
+        </div>
+      </div>
+      <div class="context-actions" style="margin-top:0.5rem">
+        <button id="applyLlm" type="button">Apply reply model</button>
+        <span id="llmHint">Cursor uses the Cursor SDK local runtime (this machine). Local uses an OpenAI-compatible chat API (Ollama / LM Studio).</span>
+      </div>
+      <div class="devices" style="margin-top:0.65rem">
+        <div>
           <label for="ttsBackend">Voice engine</label>
           <select id="ttsBackend">
             <option value="cartesia">Cartesia Sonic (cloud)</option>
@@ -460,6 +501,11 @@ HTML = """<!DOCTYPE html>
     const chatterboxUrl = document.getElementById("chatterboxUrl");
     const applyTtsBtn = document.getElementById("applyTts");
     const ttsHint = document.getElementById("ttsHint");
+    const llmBackend = document.getElementById("llmBackend");
+    const localLlmUrl = document.getElementById("localLlmUrl");
+    const localLlmModel = document.getElementById("localLlmModel");
+    const applyLlmBtn = document.getElementById("applyLlm");
+    const llmHint = document.getElementById("llmHint");
     const setupPanel = document.getElementById("setupPanel");
     const toggleSetupBtn = document.getElementById("toggleSetup");
     let lastPartialYou = null;
@@ -551,6 +597,69 @@ HTML = """<!DOCTYPE html>
         sel.appendChild(opt);
       }
     }
+
+    function llmHintFrom(data) {
+      const h = data.local_health || {};
+      const label = data.active_label || data.backend || "?";
+      const note = data.hint || "Pinned scenario context works on both backends.";
+      if (data.backend === "local") {
+        return h.ok
+          ? ("Local LLM ready — " + (data.local_model || "?") + " @ " + (data.local_url || "") + ". Active: " + label + ". " + note)
+          : ("Local LLM not ready: " + (h.error || "unreachable") + " — start Ollama/LM Studio at " + (data.local_url || ""));
+      }
+      const runtime = data.cursor_runtime || "local";
+      const base = h.reachable
+        ? ("Using Cursor (" + runtime + ") — " + (data.cursor_model || "composer-2.5"))
+        : ("Using Cursor (" + runtime + ") — " + (data.cursor_model || "composer-2.5") + ". Ollama probe: " + (h.error || "offline"));
+      return base + ". " + note;
+    }
+
+    async function loadLlmSettings() {
+      try {
+        const data = await fetch("/api/llm").then((r) => r.json());
+        if (data.backends && data.backends.length) {
+          fillSelectChoices(llmBackend, data.backends, data.backend, "id", "label");
+        } else if (data.backend) {
+          llmBackend.value = data.backend;
+        }
+        if (data.local_url) localLlmUrl.value = data.local_url;
+        if (data.local_model) localLlmModel.value = data.local_model;
+        llmHint.textContent = llmHintFrom(data);
+      } catch (err) {
+        llmHint.textContent = "Could not load reply model settings: " + err;
+      }
+    }
+
+    applyLlmBtn.addEventListener("click", async () => {
+      llmHint.textContent = "Applying reply model…";
+      try {
+        const res = await fetch("/api/llm", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            backend: llmBackend.value,
+            local_url: localLlmUrl.value,
+            local_model: localLlmModel.value,
+          }),
+        });
+        const data = await res.json();
+        if (!res.ok || data.ok === false) {
+          llmHint.textContent = data.error || "Could not apply reply model";
+          await loadLlmSettings();
+          return;
+        }
+        if (data.backends && data.backends.length) {
+          fillSelectChoices(llmBackend, data.backends, data.backend, "id", "label");
+        } else if (data.backend) {
+          llmBackend.value = data.backend;
+        }
+        if (data.local_url) localLlmUrl.value = data.local_url;
+        if (data.local_model) localLlmModel.value = data.local_model;
+        llmHint.textContent = "Now using " + (data.active_label || data.backend) + ". " + llmHintFrom(data);
+      } catch (err) {
+        llmHint.textContent = String(err);
+      }
+    });
 
     function ttsHintFrom(data) {
       const h = data.local_health || {};
@@ -1009,6 +1118,7 @@ HTML = """<!DOCTYPE html>
 
     async function boot() {
       await loadDevices();
+      await loadLlmSettings();
       await loadTtsSettings();
       await loadPinnedContext();
       const hist = await fetch("/api/history").then((r) => r.json());
@@ -1047,6 +1157,8 @@ def create_app(
     set_context: Optional[ContextSetter] = None,
     get_tts: Optional[TtsGetter] = None,
     set_tts: Optional[TtsSetter] = None,
+    get_llm: Optional[LlmGetter] = None,
+    set_llm: Optional[LlmSetter] = None,
     get_devices: Optional[Callable[[], dict[str, Any]]] = None,
     set_input: Optional[Callable[[int], Awaitable[dict[str, Any]]]] = None,
     set_output: Optional[Callable[[int], Awaitable[dict[str, Any]]]] = None,
@@ -1143,6 +1255,27 @@ def create_app(
         ok = result.get("ok") is True
         return web.json_response(result, status=200 if ok else 400)
 
+    async def get_llm_settings(_: web.Request) -> web.Response:
+        if get_llm is None:
+            return web.json_response(
+                {"ok": False, "error": "LLM settings not ready"}, status=503
+            )
+        return web.json_response(await get_llm())
+
+    async def set_llm_settings(request: web.Request) -> web.Response:
+        if set_llm is None:
+            return web.json_response(
+                {"ok": False, "error": "LLM settings not ready"}, status=503
+            )
+        body = await request.json()
+        result = await set_llm(
+            backend=body.get("backend"),
+            local_url=body.get("local_url"),
+            local_model=body.get("local_model"),
+        )
+        ok = result.get("ok") is True
+        return web.json_response(result, status=200 if ok else 400)
+
     async def respond(request: web.Request) -> web.Response:
         return await talk_start(request)
 
@@ -1198,6 +1331,8 @@ def create_app(
     app.router.add_post("/api/context", set_pinned)
     app.router.add_get("/api/tts", get_tts_settings)
     app.router.add_post("/api/tts", set_tts_settings)
+    app.router.add_get("/api/llm", get_llm_settings)
+    app.router.add_post("/api/llm", set_llm_settings)
     app.router.add_post("/api/respond", respond)
     app.router.add_get("/api/audio/devices", audio_devices)
     app.router.add_post("/api/audio/input", audio_input)
@@ -1220,6 +1355,8 @@ async def start_ui(
     set_context: Optional[ContextSetter] = None,
     get_tts: Optional[TtsGetter] = None,
     set_tts: Optional[TtsSetter] = None,
+    get_llm: Optional[LlmGetter] = None,
+    set_llm: Optional[LlmSetter] = None,
     get_devices: Optional[Callable[[], dict[str, Any]]] = None,
     set_input: Optional[Callable[[int], Awaitable[dict[str, Any]]]] = None,
     set_output: Optional[Callable[[int], Awaitable[dict[str, Any]]]] = None,
@@ -1236,6 +1373,8 @@ async def start_ui(
             set_context=set_context,
             get_tts=get_tts,
             set_tts=set_tts,
+            get_llm=get_llm,
+            set_llm=set_llm,
             get_devices=get_devices,
             set_input=set_input,
             set_output=set_output,

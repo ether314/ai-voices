@@ -14,13 +14,29 @@ from agent.expression import (
     join_speech_chunks,
     strip_tags,
 )
-from agent.fillers import FillerBank
-from agent.llm import CursorVoiceLLM
+from agent.fillers import FillerBank, last_caller_utterance
+from agent.llm import (
+    DEFAULT_MODEL as DEFAULT_CURSOR_MODEL,
+    CursorVoiceLLM,
+    resolve_cursor_runtime,
+)
+from agent.local_llm import (
+    DEFAULT_LOCAL_LLM_MODEL,
+    DEFAULT_LOCAL_LLM_URL,
+    LocalVoiceLLM,
+)
 from agent.local_tts import ChatterboxTTS, DEFAULT_CHATTERBOX_URL
 from agent.pinned_context import PinnedContextStore
 from agent.stt import InkSTT
 from agent.transcript_hub import TranscriptEvent, hub
-from agent.tts import CARTESIA_VOICES, DEFAULT_VOICE_ID, SonicTTS
+from agent.tts import (
+    DEFAULT_VOICE_ID,
+    JOE_VOICE_ID,
+    SonicTTS,
+    list_cartesia_voices,
+    resolve_cartesia_voice_id,
+    voice_label_for_id,
+)
 from agent.voice_style import (
     DEFAULT_SPEED,
     DEFAULT_TONALITY,
@@ -34,16 +50,26 @@ from agent.voice_style import (
 )
 
 # Room mic re-hears Joe from speakers; keep STT deaf until playback + reverb settle.
-ECHO_COOLDOWN_S = 0.85
+# Stereo Mix also needs mute-while-Joe (Joe is in the mix); cooldown can be shorter.
+ECHO_COOLDOWN_S = 0.55
 # Ink often fires turn.end on a short breath — brief silence check before Joe speaks.
-TURN_CONFIRM_S = 1.0
-AUTO_REPLY_COOLDOWN_S = 1.5
-FILLER_AFTER_LLM_WAIT_S = 0.9
+# Loopback / Stereo Mix: jump in earlier (more false starts OK). Room mic: wait longer.
+TURN_CONFIRM_LOOPBACK_S = 0.4
+TURN_CONFIRM_MIC_S = 0.95
+TURN_CONFIRM_S = TURN_CONFIRM_MIC_S  # default / room-mic baseline
+AUTO_REPLY_COOLDOWN_S = 0.95
+FILLER_AFTER_LLM_WAIT_S = 0.5
 TTS_BACKENDS = ("cartesia", "local")
+LLM_BACKENDS = ("cursor", "local")
 _DATA_DIR = Path(__file__).resolve().parent.parent / "data"
 _TTS_BACKEND_PATH = _DATA_DIR / "tts_backend.txt"
 _CHATTERBOX_URL_PATH = _DATA_DIR / "chatterbox_url.txt"
 _CARTESIA_VOICE_PATH = _DATA_DIR / "cartesia_voice_id.txt"
+_LLM_BACKEND_PATH = _DATA_DIR / "llm_backend.txt"
+_LOCAL_LLM_URL_PATH = _DATA_DIR / "local_llm_url.txt"
+_LOCAL_LLM_MODEL_PATH = _DATA_DIR / "local_llm_model.txt"
+
+VoiceLLM = Union[CursorVoiceLLM, LocalVoiceLLM]
 
 
 def _load_tts_backend() -> str:
@@ -76,17 +102,24 @@ def _load_chatterbox_url() -> str:
 
 def _load_cartesia_voice_id(fallback: str = DEFAULT_VOICE_ID) -> str:
     # Persisted UI selection wins so the voice dropdown survives restarts.
+    # Known-bad Jack UUID is rewritten to the account's working Jack clone.
     try:
         if _CARTESIA_VOICE_PATH.is_file():
             val = _CARTESIA_VOICE_PATH.read_text(encoding="utf-8").strip()
             if val:
-                return val
+                resolved = resolve_cartesia_voice_id(val, fallback=fallback)
+                if resolved != val:
+                    try:
+                        _save_cartesia_voice_id(resolved)
+                    except OSError:
+                        pass
+                return resolved
     except OSError:
         pass
     env = os.getenv("CARTESIA_VOICE_ID", "").strip()
     if env:
-        return env
-    return fallback or DEFAULT_VOICE_ID
+        return resolve_cartesia_voice_id(env, fallback=fallback)
+    return resolve_cartesia_voice_id(fallback or DEFAULT_VOICE_ID)
 
 
 def _save_tts_backend(backend: str) -> None:
@@ -101,7 +134,65 @@ def _save_chatterbox_url(url: str) -> None:
 
 def _save_cartesia_voice_id(voice_id: str) -> None:
     _DATA_DIR.mkdir(parents=True, exist_ok=True)
-    _CARTESIA_VOICE_PATH.write_text(voice_id.strip() + "\n", encoding="utf-8")
+    vid = resolve_cartesia_voice_id(voice_id)
+    _CARTESIA_VOICE_PATH.write_text(vid + "\n", encoding="utf-8")
+
+
+def _load_llm_backend() -> str:
+    env = os.getenv("LLM_BACKEND", "").strip().lower()
+    if env in LLM_BACKENDS:
+        return env
+    try:
+        if _LLM_BACKEND_PATH.is_file():
+            val = _LLM_BACKEND_PATH.read_text(encoding="utf-8").strip().lower()
+            if val in LLM_BACKENDS:
+                return val
+    except OSError:
+        pass
+    return "cursor"
+
+
+def _load_local_llm_url() -> str:
+    env = os.getenv("LOCAL_LLM_URL", "").strip()
+    if env:
+        return env.rstrip("/")
+    try:
+        if _LOCAL_LLM_URL_PATH.is_file():
+            val = _LOCAL_LLM_URL_PATH.read_text(encoding="utf-8").strip()
+            if val:
+                return val.rstrip("/")
+    except OSError:
+        pass
+    return DEFAULT_LOCAL_LLM_URL
+
+
+def _load_local_llm_model() -> str:
+    env = os.getenv("LOCAL_LLM_MODEL", "").strip()
+    if env:
+        return env
+    try:
+        if _LOCAL_LLM_MODEL_PATH.is_file():
+            val = _LOCAL_LLM_MODEL_PATH.read_text(encoding="utf-8").strip()
+            if val:
+                return val
+    except OSError:
+        pass
+    return DEFAULT_LOCAL_LLM_MODEL
+
+
+def _save_llm_backend(backend: str) -> None:
+    _DATA_DIR.mkdir(parents=True, exist_ok=True)
+    _LLM_BACKEND_PATH.write_text(backend + "\n", encoding="utf-8")
+
+
+def _save_local_llm_url(url: str) -> None:
+    _DATA_DIR.mkdir(parents=True, exist_ok=True)
+    _LOCAL_LLM_URL_PATH.write_text(url.rstrip("/") + "\n", encoding="utf-8")
+
+
+def _save_local_llm_model(model: str) -> None:
+    _DATA_DIR.mkdir(parents=True, exist_ok=True)
+    _LOCAL_LLM_MODEL_PATH.write_text(model.strip() + "\n", encoding="utf-8")
 
 
 class VoiceSession:
@@ -111,7 +202,7 @@ class VoiceSession:
         cartesia_api_key: str,
         cursor_api_key: str,
         voice_id: str = DEFAULT_VOICE_ID,
-        cursor_model: str = "composer-2.5",
+        cursor_model: str = DEFAULT_CURSOR_MODEL,
         cwd: Optional[str] = None,
         echo_cooldown_s: float = ECHO_COOLDOWN_S,
     ) -> None:
@@ -119,7 +210,7 @@ class VoiceSession:
         self.cursor_api_key = cursor_api_key
         # Env > persisted file > constructor/default (same pattern as TTS backend).
         self.voice_id = _load_cartesia_voice_id(voice_id or DEFAULT_VOICE_ID)
-        self.cursor_model = cursor_model
+        self.cursor_model = cursor_model or DEFAULT_CURSOR_MODEL
         self.cwd = cwd or os.getcwd()
         self.echo_cooldown_s = echo_cooldown_s
 
@@ -136,7 +227,12 @@ class VoiceSession:
         # Feed/recv death or Turn on after idle-timeout — reopen Ink websocket.
         self._stt_restart = asyncio.Event()
         self._active_speak_task: asyncio.Task[None] | None = None
-        self._llm: CursorVoiceLLM | None = None
+        self._cursor_llm: CursorVoiceLLM | None = None
+        self._local_llm: LocalVoiceLLM | None = None
+        self._llm: VoiceLLM | None = None
+        self._llm_backend = _load_llm_backend()
+        self._local_llm_url = _load_local_llm_url()
+        self._local_llm_model = _load_local_llm_model()
         self._pinned = PinnedContextStore()
         self._tts_backend = _load_tts_backend()
         self._chatterbox_url = _load_chatterbox_url()
@@ -277,6 +373,12 @@ class VoiceSession:
         print("[session] reply queued", flush=True)
         return {"ok": True, "talking": True, "auto_reply": True}
 
+    def _turn_confirm_s(self) -> float:
+        """Shorter pause confirm on Stereo Mix / loopback; longer for room mic."""
+        if self._mic.is_loopback:
+            return TURN_CONFIRM_LOOPBACK_S
+        return TURN_CONFIRM_MIC_S
+
     def _cancel_pending_auto(self) -> None:
         task = self._pending_auto_task
         self._pending_auto_task = None
@@ -288,12 +390,13 @@ class VoiceSession:
         self._cancel_pending_auto()
         self._turn_confirm_gen += 1
         gen = self._turn_confirm_gen
+        confirm_s = self._turn_confirm_s()
 
         async def _confirm() -> None:
             try:
                 while True:
                     started = asyncio.get_running_loop().time()
-                    await asyncio.sleep(TURN_CONFIRM_S)
+                    await asyncio.sleep(confirm_s)
                     if gen != self._turn_confirm_gen:
                         return
                     if not self._powered or not self._auto_reply:
@@ -317,7 +420,7 @@ class VoiceSession:
                     return
                 self._last_auto_start = now
                 print(
-                    f"[session] pause confirmed ({TURN_CONFIRM_S:.1f}s) — auto Respond",
+                    f"[session] pause confirmed ({confirm_s:.1f}s) — auto Respond",
                     flush=True,
                 )
                 await self.start_talking()
@@ -501,6 +604,158 @@ class VoiceSession:
         )
         return {"ok": True, "device": int(self._speaker.device or device)}
 
+    def _select_active_llm(self) -> None:
+        if self._llm_backend == "local" and self._local_llm is not None:
+            self._llm = self._local_llm
+        elif self._cursor_llm is not None:
+            self._llm = self._cursor_llm
+        else:
+            self._llm = self._local_llm
+
+    def _cursor_runtime(self) -> str:
+        if self._cursor_llm is not None:
+            return getattr(self._cursor_llm, "runtime", None) or resolve_cursor_runtime()
+        return resolve_cursor_runtime()
+
+    def _llm_status_label(self) -> str:
+        if self._llm_backend == "local":
+            return f"local ({self._local_llm_model})"
+        return f"cursor/{self._cursor_runtime()} ({self.cursor_model})"
+
+    async def get_llm_settings(self) -> dict[str, Any]:
+        health: dict[str, Any] = {"ok": False, "reachable": False}
+        if self._local_llm is not None:
+            health = await self._local_llm.health()
+        else:
+            probe = LocalVoiceLLM(
+                base_url=self._local_llm_url,
+                model=self._local_llm_model,
+                api_key=os.getenv("LOCAL_LLM_API_KEY", "ollama").strip() or "ollama",
+            )
+            try:
+                health = await probe.health()
+            finally:
+                await probe.close()
+        cursor_runtime = self._cursor_runtime()
+        return {
+            "ok": True,
+            "backend": self._llm_backend,
+            "backends": [
+                {
+                    "id": "cursor",
+                    "label": f"Cursor local ({self.cursor_model})",
+                },
+                {
+                    "id": "local",
+                    "label": "Local (OpenAI-compatible)",
+                },
+            ],
+            "cursor_model": self.cursor_model,
+            "cursor_runtime": cursor_runtime,
+            "local_url": self._local_llm_url,
+            "local_model": self._local_llm_model,
+            "local_health": health,
+            "active_label": self._llm_status_label(),
+            "hint": (
+                "Cursor uses the Cursor SDK local runtime (on this machine; "
+                "CURSOR_RUNTIME=local, never a cloud VM). Local calls an "
+                "OpenAI-compatible chat API (Ollama default "
+                "http://127.0.0.1:11434/v1). Pinned scenario context is injected "
+                "for both."
+            ),
+        }
+
+    async def set_llm_settings(
+        self,
+        *,
+        backend: Optional[str] = None,
+        local_url: Optional[str] = None,
+        local_model: Optional[str] = None,
+    ) -> dict[str, Any]:
+        if local_url is not None:
+            url = local_url.strip().rstrip("/")
+            if not url:
+                return {"ok": False, "error": "Local LLM URL is empty"}
+            self._local_llm_url = url
+            _save_local_llm_url(url)
+            if self._local_llm is not None:
+                self._local_llm.set_base_url(url)
+
+        if local_model is not None:
+            model = local_model.strip()
+            if not model:
+                return {"ok": False, "error": "Local LLM model name is empty"}
+            self._local_llm_model = model
+            _save_local_llm_model(model)
+            if self._local_llm is not None:
+                self._local_llm.set_model(model)
+
+        if backend is not None:
+            b = backend.strip().lower()
+            if b not in LLM_BACKENDS:
+                return {
+                    "ok": False,
+                    "error": f"Unknown LLM backend {backend!r}. Use cursor or local.",
+                }
+            if b == "local":
+                if self._local_llm is None:
+                    self._local_llm = LocalVoiceLLM(
+                        base_url=self._local_llm_url,
+                        model=self._local_llm_model,
+                        api_key=os.getenv("LOCAL_LLM_API_KEY", "ollama").strip()
+                        or "ollama",
+                    )
+                    await self._local_llm.start()
+                else:
+                    self._local_llm.set_base_url(self._local_llm_url)
+                    self._local_llm.set_model(self._local_llm_model)
+                health = await self._local_llm.health()
+                if not health.get("ok"):
+                    err = health.get("error") or "Local LLM not ready"
+                    await hub.publish(
+                        TranscriptEvent(
+                            role="error",
+                            text=f"local LLM down: {err}",
+                        )
+                    )
+                    return {
+                        "ok": False,
+                        "error": err,
+                        "local_health": health,
+                        "backend": self._llm_backend,
+                        "local_url": self._local_llm_url,
+                        "local_model": self._local_llm_model,
+                    }
+            elif b == "cursor":
+                if self._cursor_llm is None:
+                    return {
+                        "ok": False,
+                        "error": "Cursor LLM not ready — wait for Voice agent ready.",
+                    }
+                try:
+                    await self._cursor_llm.reset()
+                except Exception as exc:  # noqa: BLE001
+                    print(f"[session] Cursor reset on switch failed: {exc}", flush=True)
+
+            self._llm_backend = b
+            _save_llm_backend(b)
+            self._select_active_llm()
+            if self._llm is not None:
+                try:
+                    await self._llm.reset()
+                except Exception as exc:  # noqa: BLE001
+                    print(f"[session] LLM reset after switch failed: {exc}", flush=True)
+            label = self._llm_status_label()
+            await hub.publish(
+                TranscriptEvent(
+                    role="status",
+                    text=f"LLM_BACKEND — {label}",
+                )
+            )
+            print(f"[session] LLM backend -> {label}", flush=True)
+
+        return await self.get_llm_settings()
+
     def _select_active_tts(self) -> None:
         if self._tts_backend == "local" and self._local_tts is not None:
             self._tts = self._local_tts
@@ -516,7 +771,10 @@ class VoiceSession:
         else:
             probe = ChatterboxTTS(base_url=self._chatterbox_url)
             health = await probe.health()
-        voices = [dict(v) for v in CARTESIA_VOICES]
+        voices = await list_cartesia_voices(self.cartesia_api_key)
+        # Ensure Joe stays selectable even if a transient API miss drops him.
+        if not any(v.get("id") == JOE_VOICE_ID for v in voices):
+            voices.insert(0, {"id": JOE_VOICE_ID, "label": "Joe Marazzo"})
         known = {v["id"] for v in voices}
         if self.voice_id not in known:
             voices.insert(
@@ -610,7 +868,7 @@ class VoiceSession:
             self._fillers.set_chatterbox_url(url)
 
         if voice_id is not None:
-            vid = voice_id.strip()
+            vid = resolve_cartesia_voice_id(voice_id)
             if not vid:
                 return {"ok": False, "error": "Cartesia voice id is empty"}
             if vid != self.voice_id:
@@ -621,10 +879,8 @@ class VoiceSession:
                 self._fillers.set_cartesia_voice_id(vid)
                 if self._tts_backend == "cartesia":
                     self._fillers.start_warm(backend="cartesia")
-                label = next(
-                    (v["label"] for v in CARTESIA_VOICES if v["id"] == vid),
-                    vid[:8] + "…",
-                )
+                voices = await list_cartesia_voices(self.cartesia_api_key)
+                label = voice_label_for_id(vid, voices)
                 await hub.publish(
                     TranscriptEvent(
                         role="status",
@@ -694,13 +950,33 @@ class VoiceSession:
         async with AsyncCartesia(api_key=self.cartesia_api_key) as cartesia_stt, AsyncCartesia(
             api_key=self.cartesia_api_key
         ) as cartesia_tts:
-            llm = CursorVoiceLLM(
+            cursor_llm = CursorVoiceLLM(
                 api_key=self.cursor_api_key,
                 model=self.cursor_model,
                 cwd=self.cwd,
             )
-            await llm.start()
-            self._llm = llm
+            await cursor_llm.start()
+            self._cursor_llm = cursor_llm
+
+            local_llm = LocalVoiceLLM(
+                base_url=self._local_llm_url,
+                model=self._local_llm_model,
+                api_key=os.getenv("LOCAL_LLM_API_KEY", "ollama").strip() or "ollama",
+            )
+            await local_llm.start()
+            self._local_llm = local_llm
+            self._select_active_llm()
+            print(
+                f"LLM backend: {self._llm_status_label()} "
+                f"(local URL {self._local_llm_url})",
+                flush=True,
+            )
+            await hub.publish(
+                TranscriptEvent(
+                    role="status",
+                    text=f"LLM — {self._llm_status_label()}",
+                )
+            )
 
             async def on_tts_audio(pcm: bytes) -> None:
                 # Drop late chunks the moment Stop flips talking off.
@@ -728,11 +1004,13 @@ class VoiceSession:
             self._select_active_tts()
             self._fillers.set_chatterbox_url(self._chatterbox_url)
             self._fillers.start_warm(backend=self._tts_backend)
+            voice_label = voice_label_for_id(self.voice_id)
             print(
                 f"TTS backend: {self._tts_backend} "
                 f"(local URL {self._chatterbox_url})",
                 flush=True,
             )
+            print(f"Cartesia voice: {voice_label} ({self.voice_id})", flush=True)
 
             last_live_print = 0.0
 
@@ -822,15 +1100,17 @@ class VoiceSession:
                     return
                 if now - self._last_auto_start < AUTO_REPLY_COOLDOWN_S:
                     return
+                confirm_s = self._turn_confirm_s()
                 print(
-                    f"[session] turn.end — waiting {TURN_CONFIRM_S:.1f}s "
-                    "to confirm pause",
+                    f"[session] turn.end — waiting {confirm_s:.1f}s "
+                    "to confirm pause"
+                    + (" (loopback)" if self._mic.is_loopback else ""),
                     flush=True,
                 )
                 await hub.publish(
                     TranscriptEvent(
                         role="status",
-                        text=f"waiting — {TURN_CONFIRM_S:.1f}s pause",
+                        text=f"waiting — {confirm_s:.1f}s pause",
                     )
                 )
                 self._schedule_auto_reply()
@@ -848,7 +1128,7 @@ class VoiceSession:
             print("[mic] ready (unmuted)", flush=True)
 
             reply_task = asyncio.create_task(
-                self._reply_loop(llm), name="reply-loop"
+                self._reply_loop(), name="reply-loop"
             )
             try:
                 while not self._stop.is_set():
@@ -916,7 +1196,11 @@ class VoiceSession:
                 self._sonic = None
                 self._local_tts = None
                 self._tts = None
-                await llm.close()
+                if self._local_llm is not None:
+                    await self._local_llm.close()
+                self._local_llm = None
+                self._cursor_llm = None
+                await cursor_llm.close()
 
     async def _feed_stt(self, stt: InkSTT) -> None:
         """Keep STT fed even when TTS/LLM is slow — never block mic forever."""
@@ -952,7 +1236,7 @@ class VoiceSession:
                     return
                 await asyncio.sleep(0.05)
 
-    async def _reply_loop(self, llm: CursorVoiceLLM) -> None:
+    async def _reply_loop(self) -> None:
         while not self._stop.is_set():
             payload = await self._pending_turns.get()
             if not self._talking:
@@ -961,12 +1245,26 @@ class VoiceSession:
                 if not self._talking:
                     continue
                 self._busy = True
-                print("[agent] thinking…", flush=True)
+                llm = self._llm
+                if llm is None:
+                    await hub.publish(
+                        TranscriptEvent(
+                            role="error",
+                            text="LLM not ready — restart the app.",
+                        )
+                    )
+                    self._busy = False
+                    continue
+                print(f"[agent] thinking… ({self._llm_status_label()})", flush=True)
                 engine = self._tts_backend
+                llm_tag = "local" if self._llm_backend == "local" else "cursor"
                 await hub.publish(
                     TranscriptEvent(
                         role="status",
-                        text=f"speaking… ({'local' if engine == 'local' else 'cloud'})",
+                        text=(
+                            f"speaking… ({llm_tag} / "
+                            f"{'local' if engine == 'local' else 'cloud'} TTS)"
+                        ),
                     )
                 )
                 fresh = hub.conversation_text().strip() or payload
@@ -1012,6 +1310,7 @@ class VoiceSession:
                             continue
                         print(piece, end="", flush=True)
                         collected.append(piece)
+                        # Captions: clean speech. Audio path: keep Cartesia SSML / cues.
                         caption = strip_tags(piece)
                         if caption:
                             await hub.publish(
@@ -1021,9 +1320,8 @@ class VoiceSession:
                                     partial=True,
                                 )
                             )
-                        spoken = strip_tags(piece)
-                        if spoken:
-                            yield spoken
+                        if piece.strip():
+                            yield piece
                     print(flush=True)
 
                 speak_task: asyncio.Task[None] | None = None
@@ -1067,10 +1365,13 @@ class VoiceSession:
                                 asyncio.get_running_loop().time()
                                 - self._last_partial_at
                             )
-                            if quiet_for >= TURN_CONFIRM_S * 0.75 and self._talking:
+                            if quiet_for >= self._turn_confirm_s() * 0.75 and self._talking:
                                 self._mic.set_muted(True)
                                 filler_s = await self._fillers.enqueue(
-                                    self._speaker, backend=self._tts_backend
+                                    self._speaker,
+                                    backend=self._tts_backend,
+                                    user_text=last_caller_utterance(fresh),
+                                    pinned=pinned,
                                 )
                                 await hub.publish(
                                     TranscriptEvent(

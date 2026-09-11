@@ -3,12 +3,15 @@
 from __future__ import annotations
 
 import asyncio
+import json
+import time
 from collections.abc import AsyncIterator, Awaitable, Callable
+from pathlib import Path
 from typing import Optional
 
 from cartesia import AsyncCartesia
 
-from agent.expression import normalize_speech_for_tts, should_flush_phrase, smart_append
+from agent.expression import should_flush_phrase, smart_append, speech_for_tts
 from agent.voice_style import (
     DEFAULT_SPEED,
     DEFAULT_TONALITY,
@@ -17,18 +20,176 @@ from agent.voice_style import (
 
 OnAudioChunk = Callable[[bytes], Awaitable[None]]
 
-DEFAULT_VOICE_ID = "55e8e671-7e46-4a15-9b53-4955c92aec0c"
+# Private clones on this Cartesia account (verified via GET /voices + TTS smoke).
+JOE_VOICE_ID = "55e8e671-7e46-4a15-9b53-4955c92aec0c"
+JACK_VOICE_ID = "7e94372f-47be-42b7-ba88-1c1f463da123"
+# Stale public/docs ID that was briefly used as "Jack" — 404 on this account.
+LEGACY_BAD_JACK_ID = "9a703183-88ce-460f-a019-ee260504ef7e"
+
+DEFAULT_VOICE_ID = JACK_VOICE_ID
 DEFAULT_MODEL_ID = "sonic-3.6"
 
-# Curated Cartesia voices for the UI dropdown (id must be a real Cartesia voice UUID).
+# Offline fallback for the UI when the Cartesia voices list cannot be fetched.
 CARTESIA_VOICES: tuple[dict[str, str], ...] = (
-    {"id": DEFAULT_VOICE_ID, "label": "Joe Marazzo (default)"},
+    {"id": JOE_VOICE_ID, "label": "Joe Marazzo"},
+    {"id": JACK_VOICE_ID, "label": "Jack (default)"},
     {"id": "4e65cba0-b17c-4c6c-a985-df33894014d7", "label": "Hong"},
     {"id": "47c38ca4-5f35-497b-b1a3-415245fb35e1", "label": "Daniel — Modern Assistant"},
     {"id": "db6b0ed5-d5d3-463d-ae85-518a07d3c2b4", "label": "Skylar — Friendly Guide"},
     {"id": "30894953-bcce-41fe-892c-15ce19c843ff", "label": "Parker — Supportive Pal"},
     {"id": "ef191366-f52f-447a-a398-ed8c0f2943a1", "label": "Archie — Approachable Mate"},
 )
+
+_DATA_DIR = Path(__file__).resolve().parent.parent / "data"
+_VOICES_CACHE_PATH = _DATA_DIR / "cartesia_voices.json"
+_VOICES_CACHE_TTL_S = 6 * 60 * 60  # refresh file cache at most every 6h
+_MEM_CACHE: list[dict[str, str]] | None = None
+_MEM_CACHE_AT = 0.0
+_MEM_CACHE_TTL_S = 10 * 60  # in-process reuse for /api/tts
+_FETCH_LOCK = asyncio.Lock()
+
+
+def resolve_cartesia_voice_id(voice_id: str, *, fallback: str = DEFAULT_VOICE_ID) -> str:
+    """Map known-bad IDs to working ones; otherwise return stripped id or fallback."""
+    vid = (voice_id or "").strip()
+    if not vid:
+        return fallback or DEFAULT_VOICE_ID
+    if vid == LEGACY_BAD_JACK_ID:
+        return JACK_VOICE_ID
+    return vid
+
+
+def _pin_priority_voices(voices: list[dict[str, str]]) -> list[dict[str, str]]:
+    """Put Joe and Jack first when present; keep remaining names A–Z."""
+    by_id = {v["id"]: v for v in voices if v.get("id")}
+    pinned_ids = (JOE_VOICE_ID, JACK_VOICE_ID)
+    pinned: list[dict[str, str]] = []
+    for pid in pinned_ids:
+        if pid in by_id:
+            label = by_id[pid]["label"]
+            if pid == JACK_VOICE_ID and "(default)" not in label.lower():
+                label = f"{label} (default)" if label else "Jack (default)"
+            pinned.append({"id": pid, "label": label})
+    rest = sorted(
+        (v for v in voices if v.get("id") not in pinned_ids),
+        key=lambda v: (v.get("label") or "").lower(),
+    )
+    return pinned + rest
+
+
+def _read_voices_file_cache() -> list[dict[str, str]] | None:
+    try:
+        if not _VOICES_CACHE_PATH.is_file():
+            return None
+        raw = json.loads(_VOICES_CACHE_PATH.read_text(encoding="utf-8"))
+        fetched_at = float(raw.get("fetched_at") or 0)
+        if time.time() - fetched_at > _VOICES_CACHE_TTL_S:
+            return None
+        voices = raw.get("voices")
+        if not isinstance(voices, list) or not voices:
+            return None
+        out: list[dict[str, str]] = []
+        for item in voices:
+            if not isinstance(item, dict):
+                continue
+            vid = str(item.get("id") or "").strip()
+            label = str(item.get("label") or item.get("name") or "").strip()
+            if vid and label:
+                out.append({"id": vid, "label": label})
+        return out or None
+    except (OSError, TypeError, ValueError, json.JSONDecodeError):
+        return None
+
+
+def _write_voices_file_cache(voices: list[dict[str, str]]) -> None:
+    try:
+        _DATA_DIR.mkdir(parents=True, exist_ok=True)
+        payload = {
+            "fetched_at": time.time(),
+            "count": len(voices),
+            "voices": voices,
+        }
+        _VOICES_CACHE_PATH.write_text(
+            json.dumps(payload, ensure_ascii=False),
+            encoding="utf-8",
+        )
+    except OSError as exc:
+        print(f"[tts] could not cache cartesia voices: {exc}", flush=True)
+
+
+async def _fetch_voices_from_api(api_key: str) -> list[dict[str, str]]:
+    voices: list[dict[str, str]] = []
+    async with AsyncCartesia(api_key=api_key) as client:
+        async for v in client.voices.list(limit=100):
+            vid = getattr(v, "id", None)
+            name = getattr(v, "name", None) or "Unnamed"
+            if not vid:
+                continue
+            voices.append({"id": str(vid), "label": str(name)})
+    return _pin_priority_voices(voices)
+
+
+async def list_cartesia_voices(
+    api_key: str,
+    *,
+    force_refresh: bool = False,
+) -> list[dict[str, str]]:
+    """All Cartesia voices for the UI (API + cache). Falls back to CARTESIA_VOICES."""
+    global _MEM_CACHE, _MEM_CACHE_AT
+
+    if (
+        not force_refresh
+        and _MEM_CACHE is not None
+        and (time.time() - _MEM_CACHE_AT) < _MEM_CACHE_TTL_S
+    ):
+        return [dict(v) for v in _MEM_CACHE]
+
+    async with _FETCH_LOCK:
+        if (
+            not force_refresh
+            and _MEM_CACHE is not None
+            and (time.time() - _MEM_CACHE_AT) < _MEM_CACHE_TTL_S
+        ):
+            return [dict(v) for v in _MEM_CACHE]
+
+        if not force_refresh:
+            cached = _read_voices_file_cache()
+            if cached:
+                _MEM_CACHE = cached
+                _MEM_CACHE_AT = time.time()
+                return [dict(v) for v in cached]
+
+        if not (api_key or "").strip():
+            return [dict(v) for v in CARTESIA_VOICES]
+
+        try:
+            voices = await _fetch_voices_from_api(api_key.strip())
+        except Exception as exc:  # noqa: BLE001 — UI must still load
+            print(f"[tts] voices list failed: {exc}", flush=True)
+            cached = _read_voices_file_cache()
+            if cached:
+                _MEM_CACHE = cached
+                _MEM_CACHE_AT = time.time()
+                return [dict(v) for v in cached]
+            return [dict(v) for v in CARTESIA_VOICES]
+
+        if not voices:
+            return [dict(v) for v in CARTESIA_VOICES]
+
+        _write_voices_file_cache(voices)
+        _MEM_CACHE = voices
+        _MEM_CACHE_AT = time.time()
+        print(f"[tts] loaded {len(voices)} Cartesia voices", flush=True)
+        return [dict(v) for v in voices]
+
+
+def voice_label_for_id(voice_id: str, voices: list[dict[str, str]] | None = None) -> str:
+    vid = resolve_cartesia_voice_id(voice_id)
+    pool = voices if voices is not None else list(CARTESIA_VOICES)
+    for v in pool:
+        if v.get("id") == vid:
+            return v.get("label") or vid
+    return vid[:8] + "…" if len(vid) > 8 else vid
 
 
 class SonicTTS:
@@ -46,7 +207,7 @@ class SonicTTS:
         tonality: str = DEFAULT_TONALITY,
     ) -> None:
         self._client = client
-        self.voice_id = voice_id
+        self.voice_id = resolve_cartesia_voice_id(voice_id)
         self.model_id = model_id
         self.sample_rate = sample_rate
         self.on_audio = on_audio
@@ -95,14 +256,14 @@ class SonicTTS:
                     if not chunk:
                         continue
                     joined = smart_append(joined, chunk)
-                    spaced = normalize_speech_for_tts(joined)
-                    if should_flush_phrase(spaced, first=first):
-                        phrase = spaced.strip()
+                    # Flush on raw buffer so incomplete SSML is never split mid-tag.
+                    if should_flush_phrase(joined, first=first):
+                        phrase = speech_for_tts(joined, backend="cartesia")
                         if phrase:
                             await ctx.push(phrase + " ")
                         joined = ""
                         first = False
-                leftover = normalize_speech_for_tts(joined).strip()
+                leftover = speech_for_tts(joined, backend="cartesia")
                 if leftover and not _stop():
                     await ctx.push(leftover)
                 if _stop():

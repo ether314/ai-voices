@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import asyncio
 import random
+import re
+from collections import deque
 from pathlib import Path
 from typing import Optional
 from urllib.parse import urljoin
@@ -20,29 +22,191 @@ from agent.voice_style import (
     style_cache_tag,
 )
 
-FILLER_PHRASES: tuple[str, ...] = (
-    "Yeah.",
-    "Mm-hmm.",
-    "Right.",
-    "Okay.",
-    "Got it.",
-    "Sure.",
-    "Uh-huh.",
-    "Yeah, okay.",
+# Vibe → short phone-call acks / hesitations. Keep clips brief for latency.
+FILLER_BANK: dict[str, tuple[str, ...]] = {
+    "agree": (
+        "Yeah.",
+        "Mm-hmm.",
+        "Right.",
+        "Okay.",
+        "Got it.",
+        "Sure.",
+        "Uh-huh.",
+        "Yeah, okay.",
+        "Yep.",
+        "Gotcha.",
+        "Makes sense.",
+        "Fair enough.",
+        "I hear you.",
+        "For sure.",
+        "Alright.",
+        "True.",
+        "Totally.",
+        "Yeah, yeah.",
+        "Okay, cool.",
+        "Mhm.",
+    ),
+    "think": (
+        "Hmm.",
+        "Uh...",
+        "Well...",
+        "Okay so...",
+        "Hmm, okay.",
+        "Right, so...",
+        "One sec.",
+        "Let me see.",
+        "Interesting.",
+        "Okay...",
+        "Hmm, right.",
+        "Yeah, hang on.",
+        "So...",
+        "Alright, um...",
+    ),
+    "surprise": (
+        "Oh.",
+        "Oh wow.",
+        "Huh.",
+        "Really?",
+        "Oh okay.",
+        "Whoa.",
+        "Oh, huh.",
+        "No way.",
+        "Oh, right.",
+        "Wait, huh.",
+    ),
+    "pushback": (
+        "Hmm, maybe.",
+        "I don't know...",
+        "Well, hang on.",
+        "Hmm.",
+        "Okay but...",
+        "Not sure.",
+        "Eh...",
+        "Well...",
+        "Kinda.",
+        "Maybe.",
+    ),
+    "neutral": (
+        "Yeah.",
+        "Okay.",
+        "Right.",
+        "Mm.",
+        "Uh-huh.",
+        "Alright.",
+        "Gotcha.",
+        "Mhm.",
+        "Sure.",
+        "Yep.",
+        "Okay.",
+        "Mm-hmm.",
+    ),
+}
+
+# Flat unique list for warm / ensure_all (order stable).
+FILLER_PHRASES: tuple[str, ...] = tuple(
+    dict.fromkeys(
+        phrase
+        for phrases in FILLER_BANK.values()
+        for phrase in phrases
+    )
 )
 
+_VIBES: tuple[str, ...] = ("agree", "think", "surprise", "pushback", "neutral")
+
+_AGREE_KW = (
+    "yes",
+    "yeah",
+    "yep",
+    "exactly",
+    "agree",
+    "true",
+    "perfect",
+    "great",
+    "thanks",
+    "thank you",
+    "cool",
+    "alright",
+    "sounds good",
+    "of course",
+    "absolutely",
+    "definitely",
+    "correct",
+    "right on",
+    "love that",
+)
+_THINK_KW = (
+    "how",
+    "why",
+    "what if",
+    "explain",
+    "wonder",
+    "maybe we",
+    "should we",
+    "complicated",
+    "figure out",
+    "think about",
+    "not sure",
+    "unsure",
+    "question",
+    "could you",
+    "can you",
+    "would you",
+    "help me",
+    "walk me",
+    "clarify",
+)
+_SURPRISE_KW = (
+    "wow",
+    "crazy",
+    "can't believe",
+    "cannot believe",
+    "guess what",
+    "suddenly",
+    "oh my",
+    "no way",
+    "seriously",
+    "unexpected",
+    "shocking",
+    "insane",
+    "unbelievable",
+    "did you hear",
+    "you'll never",
+)
+_PUSHBACK_KW = (
+    "no",
+    "nah",
+    "nope",
+    "wrong",
+    "don't",
+    "doesn't",
+    "never",
+    "can't",
+    "cannot",
+    "disagree",
+    "actually",
+    "however",
+    "but ",
+    "not really",
+    "i doubt",
+    "that's not",
+    "problem",
+    "issue",
+    "wait no",
+    "hold on",
+)
+_PIN_AGREE = ("friendly", "casual", "supportive", "agree", "rapport", "warm")
+_PIN_THINK = ("interview", "technical", "plan", "strategy", "analysis", "coach")
+_PIN_PUSH = ("negotiat", "debate", "sales", "object", "pushback", "skeptic", "conflict")
+_PIN_SURPRISE = ("gossip", "news", "story", "drama", "surprise")
+
 _CACHE_DIR = Path(__file__).resolve().parent.parent / "data" / "fillers"
+_RECENT_MAX = 8
+_WORD_RE = re.compile(r"[a-z0-9']+")
 
 
 def _slug(phrase: str) -> str:
-    return (
-        phrase.lower()
-        .replace(".", "")
-        .replace(",", "")
-        .replace(" ", "_")
-        .replace("-", "_")
-        .replace("'", "")
-    )
+    s = re.sub(r"[^a-z0-9]+", "_", phrase.lower()).strip("_")
+    return s or "filler"
 
 
 def _pcm_path(
@@ -66,6 +230,68 @@ def _duration_s(pcm: bytes) -> float:
     return (len(pcm) / 2) / float(SAMPLE_RATE)
 
 
+def _norm_text(text: str) -> str:
+    return " ".join(_WORD_RE.findall((text or "").lower()))
+
+
+def _kw_hits(text: str, keywords: tuple[str, ...], *, substr: bool = False) -> float:
+    if not text:
+        return 0.0
+    score = 0.0
+    for kw in keywords:
+        if " " in kw or substr:
+            if kw in text:
+                score += 1.6 if " " in kw else 1.0
+        else:
+            # Word-boundary-ish: prefer whole tokens.
+            if f" {kw} " in f" {text} ":
+                score += 1.0
+    return score
+
+
+def classify_vibe(*, user_text: str = "", pinned: str = "") -> str:
+    """Fast keyword heuristic — no LLM. Returns a FILLER_BANK key."""
+    user = _norm_text(user_text)
+    pin = _norm_text(pinned)
+    scores = {v: 0.0 for v in _VIBES}
+    scores["neutral"] = 0.35  # mild default bias
+
+    scores["agree"] += _kw_hits(user, _AGREE_KW)
+    scores["think"] += _kw_hits(user, _THINK_KW)
+    scores["surprise"] += _kw_hits(user, _SURPRISE_KW)
+    scores["pushback"] += _kw_hits(user, _PUSHBACK_KW)
+
+    # Questions / longer turns lean "thinking".
+    raw = (user_text or "").strip()
+    if "?" in raw:
+        scores["think"] += 1.2
+    if len(user.split()) >= 18:
+        scores["think"] += 0.8
+
+    # Soft signal from pinned scenario (stems; weaker than last utterance).
+    scores["agree"] += 0.7 * _kw_hits(pin, _PIN_AGREE, substr=True)
+    scores["think"] += 0.7 * _kw_hits(pin, _PIN_THINK, substr=True)
+    scores["pushback"] += 0.7 * _kw_hits(pin, _PIN_PUSH, substr=True)
+    scores["surprise"] += 0.7 * _kw_hits(pin, _PIN_SURPRISE, substr=True)
+
+    best = max(scores.items(), key=lambda kv: kv[1])
+    # If nothing distinctive, stay neutral.
+    if best[0] != "neutral" and best[1] < scores["neutral"] + 0.45:
+        return "neutral"
+    return best[0]
+
+
+def last_caller_utterance(conversation: str) -> str:
+    """Extract the last Caller/room line from hub.conversation_text()."""
+    last = ""
+    for line in (conversation or "").splitlines():
+        s = line.strip()
+        if s.startswith("Caller/room"):
+            _, _, rest = s.partition(":")
+            last = rest.strip()
+    return last
+
+
 class FillerBank:
     """Disk-cached ack clips played while the real reply is still generating."""
 
@@ -86,7 +312,7 @@ class FillerBank:
         self._mem: dict[str, bytes] = {}
         self._lock = asyncio.Lock()
         self._warm_task: asyncio.Task[None] | None = None
-        self._rr = 0
+        self._recent: deque[str] = deque(maxlen=_RECENT_MAX)
 
     def set_chatterbox_url(self, url: str) -> None:
         self.chatterbox_url = (url or DEFAULT_CHATTERBOX_URL).rstrip("/")
@@ -110,6 +336,25 @@ class FillerBank:
             changed = True
         if changed:
             self._mem.clear()
+
+    def _mem_key(self, phrase: str, *, backend: str) -> str:
+        voice_tag = self.cartesia_voice_id if backend == "cartesia" else ""
+        style = style_cache_tag(speed=self.speed, tonality=self.tonality)
+        return f"{backend}:{voice_tag}:{style}:{phrase}"
+
+    def _disk_path(self, phrase: str, *, backend: str) -> Path:
+        voice_tag = self.cartesia_voice_id if backend == "cartesia" else ""
+        style = style_cache_tag(speed=self.speed, tonality=self.tonality)
+        return _pcm_path(
+            phrase, backend=backend, voice_id=voice_tag, style_tag=style
+        )
+
+    def _is_ready(self, phrase: str, *, backend: str) -> bool:
+        key = self._mem_key(phrase, backend=backend)
+        if key in self._mem:
+            return True
+        path = self._disk_path(phrase, backend=backend)
+        return path.is_file() and path.stat().st_size > 0
 
     def start_warm(self, *, backend: str) -> None:
         style = style_cache_tag(speed=self.speed, tonality=self.tonality)
@@ -139,19 +384,24 @@ class FillerBank:
         self._warm_task = asyncio.create_task(_run(), name="filler-warm")
 
     async def ensure_all(self, *, backend: str) -> None:
+        # Warm vibe cores first so context picks hit cache sooner.
+        ordered: list[str] = []
+        for vibe in ("neutral", "agree", "think", "surprise", "pushback"):
+            for phrase in FILLER_BANK[vibe]:
+                if phrase not in ordered:
+                    ordered.append(phrase)
         for phrase in FILLER_PHRASES:
+            if phrase not in ordered:
+                ordered.append(phrase)
+        for phrase in ordered:
             await self.ensure_one(phrase, backend=backend)
 
     async def ensure_one(self, phrase: str, *, backend: str) -> bytes:
-        voice_tag = self.cartesia_voice_id if backend == "cartesia" else ""
-        style = style_cache_tag(speed=self.speed, tonality=self.tonality)
-        key = f"{backend}:{voice_tag}:{style}:{phrase}"
+        key = self._mem_key(phrase, backend=backend)
         cached = self._mem.get(key)
         if cached:
             return cached
-        path = _pcm_path(
-            phrase, backend=backend, voice_id=voice_tag, style_tag=style
-        )
+        path = self._disk_path(phrase, backend=backend)
         if path.is_file() and path.stat().st_size > 0:
             data = path.read_bytes()
             self._mem[key] = data
@@ -232,12 +482,46 @@ class FillerBank:
             wav_bytes_to_pcm16le, wav_bytes, target_rate=SAMPLE_RATE
         )
 
-    def pick_phrase(self) -> str:
-        # Rotate with light randomness so it doesn't feel robotic.
-        self._rr = (self._rr + 1) % len(FILLER_PHRASES)
-        if random.random() < 0.35:
-            return random.choice(FILLER_PHRASES)
-        return FILLER_PHRASES[self._rr]
+    def pick_phrase(
+        self,
+        *,
+        user_text: str = "",
+        pinned: str = "",
+        backend: str = "",
+    ) -> str:
+        """Context-aware pick with recency penalty; prefer already-cached clips."""
+        vibe = classify_vibe(user_text=user_text, pinned=pinned)
+        primary = FILLER_BANK.get(vibe, FILLER_BANK["neutral"])
+        # Light mix from neutral so vibe banks don't get sticky.
+        pool = list(dict.fromkeys([*primary, *FILLER_BANK["neutral"]]))
+        recent = set(self._recent)
+        scored: list[tuple[float, str]] = []
+        for phrase in pool:
+            score = 1.0
+            if phrase in primary:
+                score += 1.4
+            if phrase in recent:
+                # Strong penalty for last few plays; still allow if pool tiny.
+                age = 0
+                for i, p in enumerate(reversed(self._recent)):
+                    if p == phrase:
+                        age = i
+                        break
+                score -= 3.5 - min(age, _RECENT_MAX) * 0.35
+            if backend and self._is_ready(phrase, backend=backend):
+                score += 2.5
+            elif backend:
+                score -= 0.8  # avoid blocking on cold TTS when possible
+            # Small jitter so ties don't always pick the same clip.
+            score += random.random() * 0.35
+            scored.append((score, phrase))
+        scored.sort(key=lambda t: t[0], reverse=True)
+        # Sample from top few for variety.
+        top = scored[: min(5, len(scored))]
+        weights = [max(0.05, s) for s, _ in top]
+        phrase = random.choices([p for _, p in top], weights=weights, k=1)[0]
+        self._recent.append(phrase)
+        return phrase
 
     async def enqueue(
         self,
@@ -245,9 +529,36 @@ class FillerBank:
         *,
         backend: str,
         phrase: Optional[str] = None,
+        user_text: str = "",
+        pinned: str = "",
     ) -> float:
         """Enqueue one filler; returns approximate duration seconds (0 if skipped)."""
-        phrase = phrase or self.pick_phrase()
+        phrase = phrase or self.pick_phrase(
+            user_text=user_text, pinned=pinned, backend=backend
+        )
+        # If the pick isn't ready, fall back to any ready clip to avoid TTS wait.
+        if not self._is_ready(phrase, backend=backend):
+            ready = [
+                p
+                for p in FILLER_PHRASES
+                if p != phrase and self._is_ready(p, backend=backend)
+            ]
+            if ready:
+                # Still warm the intended phrase in the background.
+                asyncio.create_task(
+                    self.ensure_one(phrase, backend=backend),
+                    name="filler-lazy-warm",
+                )
+                fallback = ready[0]
+                for p in ready:
+                    if p not in self._recent:
+                        fallback = p
+                        break
+                print(
+                    f"[filler] cold {phrase!r} — using cached {fallback!r}",
+                    flush=True,
+                )
+                phrase = fallback
         try:
             pcm = await self.ensure_one(phrase, backend=backend)
         except Exception as exc:  # noqa: BLE001
