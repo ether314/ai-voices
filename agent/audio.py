@@ -69,6 +69,12 @@ def _match_device_by_name(needle: str, *, kind: str = "input") -> Optional[int]:
             score += _hostapi_bonus(dev)
             if "stereo mix" in lower:
                 score += 80
+            # "Microphone Array" should not silently land on "Microphone Array 2".
+            if needle_l == "microphone array":
+                if "microphone array 1" in lower or "microphone array 2" in lower:
+                    score -= 45
+                elif "microphone array (" in lower:
+                    score += 35
         scored.append((score, i))
     if not scored:
         return None
@@ -234,11 +240,13 @@ def score_input_device(index: int, *, prefer_system: Optional[bool] = None) -> i
     else:
         # Room / laptop mics — only preferred when AUDIO_PREFER_MIC / EXTERNAL_VOICE=0.
         if "microphone array 2" in lower or "mic array 2" in lower:
-            score += 80 if prefer_system else 150
+            # WDM-KS SST endpoints often fail or stay silent vs WASAPI Array.
+            score += 40 if prefer_system else 70
         elif "microphone array 1" in lower or "mic array 1" in lower:
-            score += 50 if prefer_system else 90
+            score += 35 if prefer_system else 65
         elif "microphone array" in lower or "mic array" in lower:
-            score += 20 if prefer_system else 40
+            # Prefer the main Realtek array for "me talking" (not Stereo Mix).
+            score += 25 if prefer_system else 130
         if "webcam" in lower or "camera" in lower or "onn 4k" in lower:
             score += 25 if prefer_system else 55
         if "realtek" in lower and "mic" in lower:
@@ -352,12 +360,40 @@ def _resample_mono(mono: np.ndarray, src_rate: int, dst_rate: int = SAMPLE_RATE)
     return np.clip(out, -32768, 32767).astype(np.int16)
 
 
+def resolve_device_choice(
+    *,
+    kind: str,
+    index: Optional[int] = None,
+    name: Optional[str] = None,
+) -> Optional[int]:
+    """Prefer name match (stable across re-plugs); fall back to PortAudio index."""
+    needle = (name or "").strip()
+    # UI labels append " - loopback / system audio"; strip for matching.
+    for suffix in (" - loopback / system audio", " [loopback / system audio]"):
+        if needle.lower().endswith(suffix):
+            needle = needle[: -len(suffix)].rstrip()
+            break
+    if needle:
+        matched = _match_device_by_name(needle, kind=kind)
+        if matched is not None:
+            return matched
+    if index is not None:
+        try:
+            info = sd.query_devices(int(index))
+            ch_key = "max_input_channels" if kind == "input" else "max_output_channels"
+            if int(info.get(ch_key) or 0) > 0:
+                return int(index)
+        except Exception:  # noqa: BLE001
+            pass
+    return None
+
+
 def list_audio_devices(
     *,
     current_input: Optional[int] = None,
     current_output: Optional[int] = None,
 ) -> dict:
-    """Return selectable input/output devices for the web UI."""
+    """Return selectable input/output devices for the web UI (live PortAudio query)."""
     devices = sd.query_devices()
     default_in, default_out = sd.default.device
     inputs: list[dict] = []
@@ -373,7 +409,9 @@ def list_audio_devices(
         entry = {
             "index": i,
             "name": label,
-            "hostapi": int(dev.get("hostapi", -1)),
+            # Stable identity for UI / re-resolve when PortAudio indices shift.
+            "raw_name": name,
+            "hostapi": int(dev.get("hostapi", 0)),
             "loopback": is_loop,
         }
         if int(dev.get("max_input_channels") or 0) > 0:

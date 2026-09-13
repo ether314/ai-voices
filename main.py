@@ -1,4 +1,4 @@
-"""Local mic voice agent: Cartesia STT/TTS + Cursor / local LLM."""
+"""Local mic voice agent: local/Cartesia STT + Cursor / local LLM + Cartesia/local TTS."""
 
 from __future__ import annotations
 
@@ -71,12 +71,16 @@ async def _amain() -> None:
         on_power_on=session.turn_on,
         on_power_off=session.turn_off,
         on_respond=session.start_talking,
+        set_auto_reply=session.set_auto_reply,
+        get_session=session.get_session_state,
         get_context=session.get_pinned_context,
         set_context=session.set_pinned_context,
         get_tts=session.get_tts_settings,
         set_tts=session.set_tts_settings,
         get_llm=session.get_llm_settings,
         set_llm=session.set_llm_settings,
+        get_stt=session.get_stt_settings,
+        set_stt=session.set_stt_settings,
         get_devices=session.get_audio_devices,
         set_input=session.set_input_device,
         set_output=session.set_output_device,

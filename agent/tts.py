@@ -118,14 +118,21 @@ def _write_voices_file_cache(voices: list[dict[str, str]]) -> None:
 
 
 async def _fetch_voices_from_api(api_key: str) -> list[dict[str, str]]:
+    """Page through Cartesia GET /voices (limit≤100); pin Joe/Jack only if present."""
     voices: list[dict[str, str]] = []
+    seen: set[str] = set()
     async with AsyncCartesia(api_key=api_key) as client:
+        # AsyncPaginator yields every voice across pages.
         async for v in client.voices.list(limit=100):
             vid = getattr(v, "id", None)
             name = getattr(v, "name", None) or "Unnamed"
             if not vid:
                 continue
-            voices.append({"id": str(vid), "label": str(name)})
+            sid = str(vid)
+            if sid in seen:
+                continue
+            seen.add(sid)
+            voices.append({"id": sid, "label": str(name)})
     return _pin_priority_voices(voices)
 
 
@@ -134,7 +141,12 @@ async def list_cartesia_voices(
     *,
     force_refresh: bool = False,
 ) -> list[dict[str, str]]:
-    """All Cartesia voices for the UI (API + cache). Falls back to CARTESIA_VOICES."""
+    """Cartesia account voices for the UI.
+
+    Primary source is the live API. Short memory + file caches avoid hammering
+    the API; pass force_refresh=True (Refresh voices) to bypass both.
+    CARTESIA_VOICES is offline emergency fallback only — never the primary list.
+    """
     global _MEM_CACHE, _MEM_CACHE_AT
 
     if (
@@ -155,11 +167,12 @@ async def list_cartesia_voices(
         if not force_refresh:
             cached = _read_voices_file_cache()
             if cached:
-                _MEM_CACHE = cached
+                _MEM_CACHE = _pin_priority_voices(cached)
                 _MEM_CACHE_AT = time.time()
-                return [dict(v) for v in cached]
+                return [dict(v) for v in _MEM_CACHE]
 
         if not (api_key or "").strip():
+            print("[tts] no API key — using offline voice fallback", flush=True)
             return [dict(v) for v in CARTESIA_VOICES]
 
         try:
@@ -168,12 +181,13 @@ async def list_cartesia_voices(
             print(f"[tts] voices list failed: {exc}", flush=True)
             cached = _read_voices_file_cache()
             if cached:
-                _MEM_CACHE = cached
+                _MEM_CACHE = _pin_priority_voices(cached)
                 _MEM_CACHE_AT = time.time()
-                return [dict(v) for v in cached]
+                return [dict(v) for v in _MEM_CACHE]
             return [dict(v) for v in CARTESIA_VOICES]
 
         if not voices:
+            print("[tts] API returned 0 voices — using offline fallback", flush=True)
             return [dict(v) for v in CARTESIA_VOICES]
 
         _write_voices_file_cache(voices)

@@ -1,4 +1,9 @@
-"""Cartesia Ink-2 auto_finalize STT WebSocket."""
+"""Cartesia Ink-2 auto_finalize STT WebSocket.
+
+HARD GATE: Ink is disabled unless the session explicitly opts in with
+``allow_cloud_stt=True``. Constructing ``AsyncCartesia`` for TTS alone does
+not open this path and must not bill Speech-to-Text tokens.
+"""
 
 from __future__ import annotations
 
@@ -10,6 +15,30 @@ from cartesia import AsyncCartesia
 
 OnTurnEnd = Callable[[str], Awaitable[None]]
 OnPartial = Callable[[str], Awaitable[None]]
+
+# Module latch — flipped only by VoiceSession when Cartesia STT is intentionally enabled.
+_CLOUD_STT_PERMITTED = False
+
+
+def permit_cloud_stt(enabled: bool) -> None:
+    """Allow or forbid InkSTT websocket opens (session-owned)."""
+    global _CLOUD_STT_PERMITTED
+    _CLOUD_STT_PERMITTED = bool(enabled)
+    if enabled:
+        print(
+            "[stt] WARNING: Cartesia Ink STT PERMITTED — this bills Speech-to-Text tokens",
+            flush=True,
+        )
+    else:
+        print("[stt] Cartesia Ink STT forbidden (local / disabled)", flush=True)
+
+
+def cloud_stt_permitted() -> bool:
+    return _CLOUD_STT_PERMITTED
+
+
+class InkSTTBlockedError(RuntimeError):
+    """Raised when code tries to open Cartesia Ink without an explicit permit."""
 
 
 class InkSTT:
@@ -24,7 +53,16 @@ class InkSTT:
         sample_rate: int = 16_000,
         on_partial: Optional[OnPartial] = None,
         on_turn_end: Optional[OnTurnEnd] = None,
+        allow_cloud_stt: bool = False,
     ) -> None:
+        if not allow_cloud_stt or not _CLOUD_STT_PERMITTED:
+            msg = (
+                "REFUSING Cartesia Ink STT — cloud STT is hard-disabled. "
+                "Use local Whisper, or set STT_BACKEND=cartesia, set "
+                "ALLOW_CARTESIA_STT=1, and Apply STT with confirm_cost in the UI."
+            )
+            print(f"[stt] {msg}", flush=True)
+            raise InkSTTBlockedError(msg)
         self._client = client
         self.model = model
         self.encoding = encoding
@@ -45,15 +83,23 @@ class InkSTT:
         )
 
     async def __aenter__(self) -> "InkSTT":
+        if not _CLOUD_STT_PERMITTED:
+            msg = "REFUSING Ink websocket — Cartesia STT not permitted"
+            print(f"[stt] {msg}", flush=True)
+            raise InkSTTBlockedError(msg)
         # Allow reuse after close() — previous reconnects left _closed set forever.
         self._closed = asyncio.Event()
+        print(
+            "[stt] opening Cartesia Ink auto_finalize websocket (BILLS STT TOKENS)",
+            flush=True,
+        )
         self._connection = await self._client.stt.auto_finalize.websocket(
             encoding=self.encoding,
             model=self.model,
             sample_rate=self.sample_rate,
         ).__aenter__()
         self._recv_task = asyncio.create_task(self._receive_loop(), name="stt-receive")
-        print("[stt] websocket connected", flush=True)
+        print("[stt] websocket connected (Cartesia Ink)", flush=True)
         return self
 
     async def __aexit__(self, exc_type, exc, tb) -> None:  # noqa: ANN001

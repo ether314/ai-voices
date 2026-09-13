@@ -5,13 +5,17 @@ from __future__ import annotations
 import asyncio
 import json
 from dataclasses import asdict, dataclass
+from pathlib import Path
 from typing import Any, Literal
-
 
 from agent.expression import smart_append, strip_tags
 
 
 Role = Literal["you", "agent", "status", "error"]
+
+_DATA_DIR = Path(__file__).resolve().parent.parent / "data"
+_LOG_PATH = _DATA_DIR / "transcript_log.jsonl"
+_MAX_HISTORY = 200
 
 
 @dataclass
@@ -23,17 +27,78 @@ class TranscriptEvent:
     def to_json(self) -> str:
         return json.dumps(asdict(self), ensure_ascii=False)
 
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> TranscriptEvent | None:
+        role = data.get("role")
+        text = data.get("text")
+        if role not in ("you", "agent", "status", "error"):
+            return None
+        if not isinstance(text, str):
+            return None
+        return cls(
+            role=role,  # type: ignore[arg-type]
+            text=text,
+            partial=bool(data.get("partial", False)),
+        )
+
 
 class TranscriptHub:
-    def __init__(self) -> None:
+    def __init__(self, *, log_path: Path | None = None) -> None:
         self._subscribers: set[asyncio.Queue[TranscriptEvent]] = set()
         self._history: list[TranscriptEvent] = []
         self._lock = asyncio.Lock()
         self._live_you: str = ""
+        self._log_path = log_path or _LOG_PATH
+        self._load_from_disk()
 
     @property
     def live_you(self) -> str:
         return self._live_you
+
+    def _load_from_disk(self) -> None:
+        path = self._log_path
+        if not path.is_file():
+            return
+        loaded: list[TranscriptEvent] = []
+        try:
+            with path.open("r", encoding="utf-8") as fh:
+                for line in fh:
+                    raw = line.strip()
+                    if not raw:
+                        continue
+                    try:
+                        data = json.loads(raw)
+                    except json.JSONDecodeError:
+                        continue
+                    if not isinstance(data, dict):
+                        continue
+                    event = TranscriptEvent.from_dict(data)
+                    if event is not None:
+                        loaded.append(event)
+        except OSError as exc:
+            print(f"[transcript] could not load log: {exc}", flush=True)
+            return
+        if len(loaded) > _MAX_HISTORY:
+            loaded = loaded[-_MAX_HISTORY:]
+        self._history = loaded
+        if loaded:
+            print(
+                f"[transcript] restored {len(loaded)} event(s) from {path.name}",
+                flush=True,
+            )
+
+    def _rewrite_disk(self) -> None:
+        path = self._log_path
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            tmp = path.with_suffix(path.suffix + ".tmp")
+            with tmp.open("w", encoding="utf-8") as fh:
+                for event in self._history:
+                    fh.write(event.to_json())
+                    fh.write("\n")
+            tmp.replace(path)
+        except OSError as exc:
+            print(f"[transcript] could not save log: {exc}", flush=True)
 
     async def publish(self, event: TranscriptEvent) -> None:
         async with self._lock:
@@ -89,8 +154,10 @@ class TranscriptHub:
             else:
                 self._history.append(event)
 
-            if len(self._history) > 200:
-                self._history = self._history[-200:]
+            if len(self._history) > _MAX_HISTORY:
+                self._history = self._history[-_MAX_HISTORY:]
+
+            self._rewrite_disk()
 
             for q in list(self._subscribers):
                 self._enqueue(q, event)
@@ -164,12 +231,14 @@ class TranscriptHub:
         async with self._lock:
             self._history.clear()
             self._live_you = ""
+            self._rewrite_disk()
         event = TranscriptEvent(
             role="status",
             text="CONTEXT_CLEARED — cleared",
         )
         async with self._lock:
             self._history.append(event)
+            self._rewrite_disk()
             for q in list(self._subscribers):
                 self._enqueue(q, event)
 

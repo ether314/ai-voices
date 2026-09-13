@@ -148,12 +148,16 @@ def style_cache_tag(*, speed: float, tonality: str) -> str:
 
 def choices_payload() -> dict[str, Any]:
     return {
+        # Intentionally fixed product enums (mapped to generation_config / local knobs).
         "speeds": [dict(c) for c in SPEED_CHOICES],
         "tonalities": [dict(c) for c in TONALITY_CHOICES],
+        "speeds_source": "fixed",
+        "tonalities_source": "fixed",
         "hint": (
             "Cartesia: Sonic generation_config speed + emotion (UI baseline), "
             "plus inline SSML / [laughter] from the LLM when present. "
             "Local: temperature (+ exaggeration if supported) and time-stretch speed; "
-            "Cartesia SSML is adapted or stripped."
+            "Cartesia SSML is adapted or stripped. "
+            "Speed & tonality options are fixed product enums."
         ),
     }

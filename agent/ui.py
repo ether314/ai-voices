@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 from collections.abc import Awaitable, Callable
 from typing import Any, Optional
 
@@ -9,13 +10,33 @@ from aiohttp import web
 
 from agent.transcript_hub import TranscriptHub, hub
 
+
+def _json_dumps(obj: Any) -> str:
+    """Strict single-value JSON (reject NaN/Inf; stringify unknown types)."""
+    return json.dumps(obj, ensure_ascii=False, allow_nan=False, default=str)
+
+
+def _json_response(data: Any, *, status: int = 200) -> web.Response:
+    try:
+        return web.json_response(data, status=status, dumps=_json_dumps)
+    except (TypeError, ValueError) as exc:
+        return web.json_response(
+            {"ok": False, "error": f"JSON serialize failed: {exc}"},
+            status=500,
+        )
+
 RespondHandler = Callable[[], Awaitable[dict[str, Any]]]
+AutoReplySetter = Callable[[bool], Awaitable[dict[str, Any]]]
 ContextGetter = Callable[[], Awaitable[dict[str, Any]]]
 ContextSetter = Callable[[str], Awaitable[dict[str, Any]]]
-TtsGetter = Callable[[], Awaitable[dict[str, Any]]]
+SessionGetter = Callable[[], Awaitable[dict[str, Any]]]
+TtsGetter = Callable[..., Awaitable[dict[str, Any]]]
 TtsSetter = Callable[..., Awaitable[dict[str, Any]]]
 LlmGetter = Callable[[], Awaitable[dict[str, Any]]]
 LlmSetter = Callable[..., Awaitable[dict[str, Any]]]
+SttGetter = Callable[[], Awaitable[dict[str, Any]]]
+SttSetter = Callable[..., Awaitable[dict[str, Any]]]
+AudioDeviceSetter = Callable[..., Awaitable[dict[str, Any]]]
 
 HTML = """<!DOCTYPE html>
 <html lang="en">
@@ -115,6 +136,32 @@ HTML = """<!DOCTYPE html>
     }
     #stopTalk:hover { filter: brightness(1.06); }
     #stopTalk:disabled {
+      opacity: 0.45;
+      cursor: default;
+      filter: none;
+    }
+    #autoReply {
+      margin-left: 0.45rem;
+      border: 1px solid var(--line);
+      border-radius: 999px;
+      padding: 0.85rem 1.15rem;
+      font-size: 0.9rem;
+      font-weight: 700;
+      cursor: pointer;
+      background: transparent;
+      color: var(--muted);
+      white-space: nowrap;
+      user-select: none;
+    }
+    #autoReply.on {
+      background: #0ea5e9;
+      color: #082f49;
+      border-color: transparent;
+      box-shadow: 0 0 0 1px rgba(14, 165, 233, 0.35);
+    }
+    #autoReply:hover { filter: brightness(1.06); color: #e2e8f0; }
+    #autoReply.on:hover { color: #082f49; }
+    #autoReply:disabled {
       opacity: 0.45;
       cursor: default;
       filter: none;
@@ -292,9 +339,32 @@ HTML = """<!DOCTYPE html>
       color: #f8fafc;
     }
     #applyTts:hover { filter: brightness(1.08); }
+    #refreshVoices, #refreshDevices {
+      border: 1px solid var(--line);
+      border-radius: 999px;
+      padding: 0.65rem 1.0rem;
+      font-size: 0.8rem;
+      font-weight: 600;
+      cursor: pointer;
+      background: transparent;
+      color: var(--muted);
+    }
+    #refreshVoices:hover, #refreshDevices:hover {
+      color: #e2e8f0;
+      border-color: #64748b;
+    }
     #ttsHint {
       font-size: 0.75rem;
       color: var(--muted);
+    }
+    .field-note {
+      display: block;
+      margin-top: 0.25rem;
+      font-size: 0.65rem;
+      letter-spacing: 0.04em;
+      text-transform: none;
+      color: #64748b;
+      font-weight: 400;
     }
     #applyLlm {
       border: none;
@@ -369,15 +439,16 @@ HTML = """<!DOCTYPE html>
     <div class="top">
       <div>
         <h1>Voice agent <span id="status">connecting…</span></h1>
-        <p>Auto turn-taking · <strong>Respond</strong> / <strong>Stop</strong></p>
+        <p>Pause replies need <strong>Auto-reply</strong> on · <strong>Respond</strong> speaks now (and turns auto on) · <strong>Stop</strong> silences and turns auto off</p>
       </div>
       <div>
         <button id="respond" type="button">Respond as Joe</button>
+        <button id="autoReply" type="button" title="When on, a pause in others' speech starts Joe's reply">Auto-reply: off</button>
         <button id="stopTalk" type="button">Stop</button>
         <button id="clearCtx" type="button" class="secondary">Refresh chat</button>
         <button id="quitApp" type="button">Turn off</button>
         <button id="toggleSetup" type="button">Hide setup</button>
-        <div id="btnHint">auto on</div>
+        <div id="btnHint">auto off</div>
       </div>
     </div>
     <div id="setupPanel">
@@ -395,25 +466,35 @@ HTML = """<!DOCTYPE html>
       </div>
       <div class="devices">
         <div>
-          <label for="inputDevice">Microphone input</label>
+          <label for="inputDevice">Microphone input <span class="field-note">live from this PC</span></label>
           <select id="inputDevice"></select>
         </div>
         <div>
-          <label for="outputDevice">Speaker output</label>
+          <label for="outputDevice">Speaker output <span class="field-note">live from this PC</span></label>
           <select id="outputDevice"></select>
         </div>
       </div>
+      <div class="context-actions" style="margin-top:0.5rem">
+        <button id="refreshDevices" type="button">Refresh devices</button>
+      </div>
       <div class="devices" style="margin-top:0.65rem">
         <div>
-          <label for="llmBackend">Reply model</label>
-          <select id="llmBackend">
-            <option value="cursor">Cursor local (composer-2.5)</option>
-            <option value="local">Local (OpenAI-compatible)</option>
-          </select>
+          <label for="sttBackend">Speech-to-text <span class="field-note">product backends</span></label>
+          <select id="sttBackend"></select>
+        </div>
+      </div>
+      <div class="context-actions" style="margin-top:0.5rem">
+        <button id="applyStt" type="button">Apply STT</button>
+        <span id="sttHint">Local Whisper keeps Cartesia STT tokens at zero. Cartesia Ink needs ALLOW_CARTESIA_STT=1 in .env plus an explicit cost confirmation.</span>
+      </div>
+      <div class="devices" style="margin-top:0.65rem">
+        <div>
+          <label for="llmBackend">Reply model <span class="field-note">product backends</span></label>
+          <select id="llmBackend"></select>
         </div>
         <div>
-          <label for="localLlmModel">Local model name</label>
-          <input id="localLlmModel" type="text" value="llama3.2" />
+          <label for="localLlmModel">Local model name <span class="field-note">live from Ollama /v1/models when reachable</span></label>
+          <select id="localLlmModel"></select>
         </div>
       </div>
       <div class="devices" style="margin-top:0.65rem">
@@ -424,43 +505,26 @@ HTML = """<!DOCTYPE html>
       </div>
       <div class="context-actions" style="margin-top:0.5rem">
         <button id="applyLlm" type="button">Apply reply model</button>
-        <span id="llmHint">Cursor uses the Cursor SDK local runtime (this machine). Local uses an OpenAI-compatible chat API (Ollama / LM Studio).</span>
+        <span id="llmHint">Reply model: Cursor (local)</span>
       </div>
       <div class="devices" style="margin-top:0.65rem">
         <div>
-          <label for="ttsBackend">Voice engine</label>
-          <select id="ttsBackend">
-            <option value="cartesia">Cartesia Sonic (cloud)</option>
-            <option value="local">Local GPU Chatterbox (Docker)</option>
-          </select>
+          <label for="ttsBackend">Voice engine <span class="field-note">product backends</span></label>
+          <select id="ttsBackend"></select>
         </div>
         <div>
-          <label for="cartesiaVoice">Cartesia voice</label>
+          <label for="cartesiaVoice">Cartesia voice <span class="field-note">live from Cartesia API</span></label>
           <select id="cartesiaVoice"></select>
         </div>
       </div>
       <div class="devices" style="margin-top:0.65rem">
         <div>
-          <label for="ttsSpeed">Speaking speed</label>
-          <select id="ttsSpeed">
-            <option value="0.8">Slow (0.8×)</option>
-            <option value="0.9">Slightly slow (0.9×)</option>
-            <option value="1.0" selected>Normal (1.0×)</option>
-            <option value="1.15">Slightly fast (1.15×)</option>
-            <option value="1.3">Fast (1.3×)</option>
-            <option value="1.45">Very fast (1.45×)</option>
-          </select>
+          <label for="ttsSpeed">Speaking speed <span class="field-note">fixed product enum</span></label>
+          <select id="ttsSpeed"></select>
         </div>
         <div>
-          <label for="ttsTonality">Tonality / delivery</label>
-          <select id="ttsTonality">
-            <option value="neutral" selected>Neutral</option>
-            <option value="calm">Calm</option>
-            <option value="warm">Warm</option>
-            <option value="energetic">Energetic</option>
-            <option value="serious">Serious</option>
-            <option value="cheerful">Cheerful</option>
-          </select>
+          <label for="ttsTonality">Tonality / delivery <span class="field-note">fixed product enum</span></label>
+          <select id="ttsTonality"></select>
         </div>
       </div>
       <div class="devices" style="margin-top:0.65rem">
@@ -471,6 +535,7 @@ HTML = """<!DOCTYPE html>
       </div>
       <div class="context-actions" style="margin-top:0.5rem">
         <button id="applyTts" type="button">Apply voice settings</button>
+        <button id="refreshVoices" type="button">Refresh voices</button>
         <span id="ttsHint">Speed &amp; tonality apply to Cartesia (Sonic emotion) and local Chatterbox (temperature + time-stretch). Cartesia voice is cloud-only.</span>
       </div>
       <div id="deviceHint">TikTok / browser livestream → Stereo Mix (loopback / system audio). Room phone near laptop → Microphone Array. If Stereo Mix is missing: Sound settings → Recording → Show Disabled Devices → Enable Stereo Mix.</div>
@@ -484,6 +549,7 @@ HTML = """<!DOCTYPE html>
     const liveText = liveBox.querySelector(".text");
     const liveLabel = document.getElementById("liveLabel");
     const respondBtn = document.getElementById("respond");
+    const autoReplyBtn = document.getElementById("autoReply");
     const stopBtn = document.getElementById("stopTalk");
     const clearBtn = document.getElementById("clearCtx");
     const quitBtn = document.getElementById("quitApp");
@@ -500,20 +566,53 @@ HTML = """<!DOCTYPE html>
     const ttsTonality = document.getElementById("ttsTonality");
     const chatterboxUrl = document.getElementById("chatterboxUrl");
     const applyTtsBtn = document.getElementById("applyTts");
+    const refreshVoicesBtn = document.getElementById("refreshVoices");
+    const refreshDevicesBtn = document.getElementById("refreshDevices");
     const ttsHint = document.getElementById("ttsHint");
     const llmBackend = document.getElementById("llmBackend");
     const localLlmUrl = document.getElementById("localLlmUrl");
     const localLlmModel = document.getElementById("localLlmModel");
     const applyLlmBtn = document.getElementById("applyLlm");
     const llmHint = document.getElementById("llmHint");
+    const sttBackend = document.getElementById("sttBackend");
+    const applySttBtn = document.getElementById("applyStt");
+    const sttHint = document.getElementById("sttHint");
     const setupPanel = document.getElementById("setupPanel");
     const toggleSetupBtn = document.getElementById("toggleSetup");
     let lastPartialYou = null;
     let lastPartialAgent = null;
     let talking = false;
+    let autoReply = false;
     let loadingDevices = false;
     let powered = true;
     let setupCollapsed = false;
+    let ws = null;
+    let histReady = false;
+    let pendingEvents = [];
+    let bootStarted = false;
+
+    async function readJson(res) {
+      const text = await res.text();
+      try {
+        return JSON.parse(text);
+      } catch (err) {
+        const snip = String(text || "").slice(0, 160).replace(/\\s+/g, " ");
+        const where = res.url || "(unknown url)";
+        throw new Error(
+          "Bad JSON from " + where + " (HTTP " + res.status + "): " + snip
+        );
+      }
+    }
+
+    function parseWsJson(raw) {
+      try {
+        return JSON.parse(raw);
+      } catch (err) {
+        const snip = String(raw || "").slice(0, 160).replace(/\\s+/g, " ");
+        console.warn("Bad WebSocket JSON:", snip, err);
+        return null;
+      }
+    }
 
     function applySetupCollapsed(collapsed) {
       setupCollapsed = !!collapsed;
@@ -553,7 +652,8 @@ HTML = """<!DOCTYPE html>
       for (const d of items) {
         const opt = document.createElement("option");
         opt.value = String(d.index);
-        opt.textContent = d.index + ": " + d.name;
+        opt.textContent = d.name;
+        opt.dataset.rawName = d.raw_name || d.name || "";
         if (d.index === current) opt.selected = true;
         sel.appendChild(opt);
       }
@@ -584,9 +684,11 @@ HTML = """<!DOCTYPE html>
       const list = items && items.length ? items : [];
       for (const item of list) {
         const opt = document.createElement("option");
-        opt.value = String(item[valueKey]);
-        opt.textContent = item[labelKey] || String(item[valueKey]);
-        if (String(item[valueKey]) === cur) opt.selected = true;
+        const val = typeof item === "string" ? item : String(item[valueKey]);
+        const lab = typeof item === "string" ? item : (item[labelKey] || val);
+        opt.value = val;
+        opt.textContent = lab;
+        if (val === cur) opt.selected = true;
         sel.appendChild(opt);
       }
       if (cur && ![...sel.options].some((o) => o.value === cur)) {
@@ -598,32 +700,108 @@ HTML = """<!DOCTYPE html>
       }
     }
 
+    function fillLocalModels(models, current) {
+      const list = (models && models.length)
+        ? models.map((id) => ({ id: String(id), label: String(id) }))
+        : [];
+      if (!list.length && current) {
+        list.push({ id: String(current), label: String(current) });
+      }
+      fillSelectChoices(localLlmModel, list, current, "id", "label");
+    }
+
     function llmHintFrom(data) {
       const h = data.local_health || {};
-      const label = data.active_label || data.backend || "?";
-      const note = data.hint || "Pinned scenario context works on both backends.";
-      if (data.backend === "local") {
-        return h.ok
-          ? ("Local LLM ready — " + (data.local_model || "?") + " @ " + (data.local_url || "") + ". Active: " + label + ". " + note)
-          : ("Local LLM not ready: " + (h.error || "unreachable") + " — start Ollama/LM Studio at " + (data.local_url || ""));
-      }
       const runtime = data.cursor_runtime || "local";
-      const base = h.reachable
-        ? ("Using Cursor (" + runtime + ") — " + (data.cursor_model || "composer-2.5"))
-        : ("Using Cursor (" + runtime + ") — " + (data.cursor_model || "composer-2.5") + ". Ollama probe: " + (h.error || "offline"));
-      return base + ". " + note;
+      const model = data.cursor_model || "composer-2.5";
+      if (data.backend === "local") {
+        const url = data.local_url || "";
+        const name = data.local_model || "?";
+        if (h.ok) {
+          return "Local LLM connected — " + name + " @ " + url;
+        }
+        return "Local LLM refused — " + (h.error || "unreachable") + " @ " + url;
+      }
+      return "Reply model: Cursor (" + runtime + ") — " + model;
     }
+
+    function sttHintFrom(data) {
+      const label = data.active_label || data.backend || "?";
+      const note = data.hint || "";
+      const hw = (data.stt_device && data.stt_compute_type)
+        ? (" Device: " + data.stt_device + "/" + data.stt_compute_type + ".")
+        : "";
+      if (data.backend === "local") {
+        return "Using local Whisper (" + (data.whisper_model || "?") + ") on this PC — no Cartesia STT tokens." + hw + " " + note;
+      }
+      return "Using Cartesia Ink-2 — this bills Cartesia STT tokens. Active: " + label + ". " + note;
+    }
+
+    async function loadSttSettings() {
+      try {
+        const data = await fetch("/api/stt").then((r) => readJson(r));
+        if (data.backends && data.backends.length) {
+          fillSelectChoices(sttBackend, data.backends, data.backend, "id", "label");
+        } else if (data.backend) {
+          sttBackend.value = data.backend;
+        }
+        sttHint.textContent = sttHintFrom(data);
+      } catch (err) {
+        sttHint.textContent = "Could not load STT settings: " + err;
+      }
+    }
+
+    applySttBtn.addEventListener("click", async () => {
+      const chosen = sttBackend.value;
+      let confirmCost = false;
+      if (chosen === "cartesia") {
+        const ok = window.confirm(
+          "Cartesia Ink Speech-to-Text BILLS STT TOKENS on your Cartesia account.\\n\\n" +
+          "Also required: ALLOW_CARTESIA_STT=1 in .env (then restart).\\n\\n" +
+          "Prefer Local Whisper to keep STT tokens at zero.\\n\\n" +
+          "Enable Cartesia Ink anyway?"
+        );
+        if (!ok) {
+          sttHint.textContent = "Cancelled — stayed on current STT backend.";
+          await loadSttSettings();
+          return;
+        }
+        confirmCost = true;
+      }
+      sttHint.textContent = "Applying STT…";
+      try {
+        const res = await fetch("/api/stt", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ backend: chosen, confirm_cost: confirmCost }),
+        });
+        const data = await readJson(res);
+        if (!res.ok || data.ok === false) {
+          sttHint.textContent = data.error || "Could not apply STT";
+          await loadSttSettings();
+          return;
+        }
+        if (data.backends && data.backends.length) {
+          fillSelectChoices(sttBackend, data.backends, data.backend, "id", "label");
+        } else if (data.backend) {
+          sttBackend.value = data.backend;
+        }
+        sttHint.textContent = "Now using " + (data.active_label || data.backend) + ". " + sttHintFrom(data);
+      } catch (err) {
+        sttHint.textContent = String(err);
+      }
+    });
 
     async function loadLlmSettings() {
       try {
-        const data = await fetch("/api/llm").then((r) => r.json());
+        const data = await fetch("/api/llm").then((r) => readJson(r));
         if (data.backends && data.backends.length) {
           fillSelectChoices(llmBackend, data.backends, data.backend, "id", "label");
         } else if (data.backend) {
           llmBackend.value = data.backend;
         }
         if (data.local_url) localLlmUrl.value = data.local_url;
-        if (data.local_model) localLlmModel.value = data.local_model;
+        fillLocalModels(data.local_models || (data.local_health && data.local_health.models) || [], data.local_model);
         llmHint.textContent = llmHintFrom(data);
       } catch (err) {
         llmHint.textContent = "Could not load reply model settings: " + err;
@@ -642,7 +820,7 @@ HTML = """<!DOCTYPE html>
             local_model: localLlmModel.value,
           }),
         });
-        const data = await res.json();
+        const data = await readJson(res);
         if (!res.ok || data.ok === false) {
           llmHint.textContent = data.error || "Could not apply reply model";
           await loadLlmSettings();
@@ -654,8 +832,8 @@ HTML = """<!DOCTYPE html>
           llmBackend.value = data.backend;
         }
         if (data.local_url) localLlmUrl.value = data.local_url;
-        if (data.local_model) localLlmModel.value = data.local_model;
-        llmHint.textContent = "Now using " + (data.active_label || data.backend) + ". " + llmHintFrom(data);
+        fillLocalModels(data.local_models || (data.local_health && data.local_health.models) || [], data.local_model);
+        llmHint.textContent = llmHintFrom(data);
       } catch (err) {
         llmHint.textContent = String(err);
       }
@@ -679,23 +857,39 @@ HTML = """<!DOCTYPE html>
       return base + " — voice: " + voiceLabel + " · delivery: " + delivery;
     }
 
-    async function loadTtsSettings() {
+    function applyTtsPayload(data) {
+      if (data.backends && data.backends.length) {
+        fillSelectChoices(ttsBackend, data.backends, data.backend, "id", "label");
+      } else if (data.backend) {
+        ttsBackend.value = data.backend;
+      }
+      if (data.chatterbox_url) chatterboxUrl.value = data.chatterbox_url;
+      fillCartesiaVoices(data.voices || [], data.voice_id);
+      if (data.speeds && data.speeds.length) {
+        fillSelectChoices(ttsSpeed, data.speeds, data.speed, "value", "label");
+      } else if (data.speed != null) {
+        ttsSpeed.value = String(data.speed);
+      }
+      if (data.tonalities && data.tonalities.length) {
+        fillSelectChoices(ttsTonality, data.tonalities, data.tonality, "id", "label");
+      } else if (data.tonality) {
+        ttsTonality.value = data.tonality;
+      }
+    }
+
+    async function loadTtsSettings(opts) {
+      const force = !!(opts && opts.refreshVoices);
       try {
-        const data = await fetch("/api/tts").then((r) => r.json());
-        if (data.backend) ttsBackend.value = data.backend;
-        if (data.chatterbox_url) chatterboxUrl.value = data.chatterbox_url;
-        fillCartesiaVoices(data.voices || [], data.voice_id);
-        if (data.speeds && data.speeds.length) {
-          fillSelectChoices(ttsSpeed, data.speeds, data.speed, "value", "label");
-        } else if (data.speed != null) {
-          ttsSpeed.value = String(data.speed);
+        const url = force ? "/api/tts?refresh_voices=1" : "/api/tts";
+        if (force) ttsHint.textContent = "Refreshing Cartesia voices from API…";
+        const data = await fetch(url).then((r) => readJson(r));
+        applyTtsPayload(data);
+        const count = data.voices_count != null ? data.voices_count : ((data.voices && data.voices.length) || 0);
+        if (force) {
+          ttsHint.textContent = "Loaded " + count + " Cartesia voices from API. " + ttsHintFrom(data);
+        } else {
+          ttsHint.textContent = ttsHintFrom(data) + " (" + count + " voices)";
         }
-        if (data.tonalities && data.tonalities.length) {
-          fillSelectChoices(ttsTonality, data.tonalities, data.tonality, "id", "label");
-        } else if (data.tonality) {
-          ttsTonality.value = data.tonality;
-        }
-        ttsHint.textContent = ttsHintFrom(data);
       } catch (err) {
         ttsHint.textContent = "Could not load voice engine settings: " + err;
       }
@@ -715,21 +909,13 @@ HTML = """<!DOCTYPE html>
             tonality: ttsTonality.value,
           }),
         });
-        const data = await res.json();
+        const data = await readJson(res);
         if (!res.ok || data.ok === false) {
           ttsHint.textContent = data.error || "Could not apply voice settings";
           await loadTtsSettings();
           return;
         }
-        if (data.backend) ttsBackend.value = data.backend;
-        if (data.chatterbox_url) chatterboxUrl.value = data.chatterbox_url;
-        fillCartesiaVoices(data.voices || [], data.voice_id);
-        if (data.speeds && data.speeds.length) {
-          fillSelectChoices(ttsSpeed, data.speeds, data.speed, "value", "label");
-        }
-        if (data.tonalities && data.tonalities.length) {
-          fillSelectChoices(ttsTonality, data.tonalities, data.tonality, "id", "label");
-        }
+        applyTtsPayload(data);
         ttsHint.textContent = data.backend === "local"
           ? ttsHintFrom(data)
           : ("Now using Cartesia — " + ((cartesiaVoice.selectedOptions[0] && cartesiaVoice.selectedOptions[0].textContent) || data.voice_id) + " · " + (data.speed != null ? Number(data.speed) : 1) + "× · " + (data.tonality || "neutral"));
@@ -738,10 +924,14 @@ HTML = """<!DOCTYPE html>
       }
     });
 
+    refreshVoicesBtn.addEventListener("click", async () => {
+      await loadTtsSettings({ refreshVoices: true });
+    });
+
     async function loadDevices() {
       loadingDevices = true;
       try {
-        const data = await fetch("/api/audio/devices").then((r) => r.json());
+        const data = await fetch("/api/audio/devices").then((r) => readJson(r));
         fillSelect(inputDevice, data.inputs || [], data.current_input);
         fillSelect(outputDevice, data.outputs || [], data.current_output);
         deviceHint.textContent = data.hint
@@ -755,15 +945,20 @@ HTML = """<!DOCTYPE html>
       }
     }
 
-    async function setDevice(kind, index) {
+    refreshDevicesBtn.addEventListener("click", async () => {
+      deviceHint.textContent = "Refreshing audio devices…";
+      await loadDevices();
+    });
+
+    async function setDevice(kind, index, name) {
       deviceHint.textContent = "Switching " + kind + "…";
       try {
         const res = await fetch("/api/audio/" + kind, {
           method: "POST",
           headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ device: Number(index) }),
+          body: JSON.stringify({ device: Number(index), name: name || "" }),
         });
-        const data = await res.json();
+        const data = await readJson(res);
         if (!res.ok || data.ok === false) {
           deviceHint.textContent = data.error || ("Failed to set " + kind);
           await loadDevices();
@@ -771,7 +966,7 @@ HTML = """<!DOCTYPE html>
         }
         if (kind === "input") {
           const opt = inputDevice.selectedOptions[0];
-          const label = (opt && opt.textContent) || ("device " + index);
+          const label = (opt && opt.textContent) || name || ("device " + index);
           const confirm = label.toLowerCase().includes("loopback")
             ? "Capturing system / livestream audio via " + label + ". Joe mutes while speaking."
             : "Microphone updated -> " + label + ". For TikTok audio, pick Stereo Mix (loopback).";
@@ -786,22 +981,39 @@ HTML = """<!DOCTYPE html>
 
     inputDevice.addEventListener("change", () => {
       if (loadingDevices) return;
-      setDevice("input", inputDevice.value);
+      const opt = inputDevice.selectedOptions[0];
+      setDevice("input", inputDevice.value, opt && opt.dataset.rawName);
     });
     outputDevice.addEventListener("change", () => {
       if (loadingDevices) return;
-      setDevice("output", outputDevice.value);
+      const opt = outputDevice.selectedOptions[0];
+      setDevice("output", outputDevice.value, opt && opt.dataset.rawName);
     });
+
+    function autoHint() {
+      if (!powered) return "off";
+      if (talking) return "speaking";
+      return autoReply
+        ? "auto on — pause starts reply"
+        : "auto off — enable Auto-reply";
+    }
+
+    function setAutoReplyUI(on) {
+      autoReply = !!on;
+      if (autoReplyBtn) {
+        autoReplyBtn.textContent = autoReply ? "Auto-reply: on" : "Auto-reply: off";
+        autoReplyBtn.classList.toggle("on", autoReply);
+        autoReplyBtn.disabled = !powered;
+      }
+      if (!talking) btnHint.textContent = autoHint();
+    }
 
     function setTalkingUI(on) {
       talking = on;
       respondBtn.disabled = !powered;
       stopBtn.disabled = !powered;
-      if (on) {
-        btnHint.textContent = "speaking";
-      } else {
-        btnHint.textContent = powered ? "auto on" : "off";
-      }
+      if (autoReplyBtn) autoReplyBtn.disabled = !powered;
+      btnHint.textContent = autoHint();
     }
 
     function setPowerUI(on) {
@@ -811,17 +1023,18 @@ HTML = """<!DOCTYPE html>
         quitBtn.textContent = "Turn off";
         statusEl.textContent = "live";
         statusEl.className = "ok";
-        btnHint.textContent = talking ? "speaking" : "auto on";
+        btnHint.textContent = autoHint();
       } else {
         quitBtn.classList.add("off");
         quitBtn.textContent = "Turn on";
         statusEl.textContent = "off";
         statusEl.className = "";
-        setTalkingUI(false);
+        talking = false;
         btnHint.textContent = "off";
       }
       respondBtn.disabled = !on;
       stopBtn.disabled = !on;
+      if (autoReplyBtn) autoReplyBtn.disabled = !on;
     }
 
     async function doStart() {
@@ -832,12 +1045,14 @@ HTML = """<!DOCTYPE html>
       btnHint.textContent = "Starting reply…";
       try {
         const res = await fetch("/api/talk/start", { method: "POST" });
-        const data = await res.json();
+        const data = await readJson(res);
         if (!res.ok || data.ok === false) {
           btnHint.textContent = data.error || "Could not start";
           setTalkingUI(false);
           return;
         }
+        if (typeof data.auto_reply === "boolean") setAutoReplyUI(data.auto_reply);
+        else setAutoReplyUI(true);
         setTalkingUI(true);
       } catch (err) {
         btnHint.textContent = String(err);
@@ -848,12 +1063,40 @@ HTML = """<!DOCTYPE html>
     async function doStop() {
       btnHint.textContent = "Stopping…";
       try {
-        await fetch("/api/talk/stop", { method: "POST" });
+        const res = await fetch("/api/talk/stop", { method: "POST" });
+        const data = await readJson(res);
+        if (typeof data.auto_reply === "boolean") setAutoReplyUI(data.auto_reply);
+        else setAutoReplyUI(false);
+      } catch (err) {
+        btnHint.textContent = String(err);
+        setAutoReplyUI(false);
+      }
+      setTalkingUI(false);
+    }
+
+    async function doToggleAuto() {
+      if (!powered) {
+        btnHint.textContent = "App is off — click Turn on first";
+        return;
+      }
+      const next = !autoReply;
+      btnHint.textContent = next ? "Enabling auto…" : "Disabling auto…";
+      try {
+        const res = await fetch("/api/auto-reply", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ enabled: next }),
+        });
+        const data = await readJson(res);
+        if (!res.ok || data.ok === false) {
+          btnHint.textContent = data.error || "Could not set auto-reply";
+          return;
+        }
+        if (typeof data.auto_reply === "boolean") setAutoReplyUI(data.auto_reply);
+        else setAutoReplyUI(next);
       } catch (err) {
         btnHint.textContent = String(err);
       }
-      setTalkingUI(false);
-      btnHint.textContent = "auto paused";
     }
 
     async function doPowerOff() {
@@ -861,11 +1104,13 @@ HTML = """<!DOCTYPE html>
       try {
         if (talking) await doStop();
         const res = await fetch("/api/power/off", { method: "POST" });
-        const data = await res.json();
+        const data = await readJson(res);
         if (!res.ok || data.ok === false) {
           btnHint.textContent = data.error || "Could not turn off";
           return;
         }
+        if (typeof data.auto_reply === "boolean") setAutoReplyUI(data.auto_reply);
+        else setAutoReplyUI(false);
         setPowerUI(false);
       } catch (err) {
         btnHint.textContent = String(err);
@@ -876,11 +1121,12 @@ HTML = """<!DOCTYPE html>
       btnHint.textContent = "Turning on…";
       try {
         const res = await fetch("/api/power/on", { method: "POST" });
-        const data = await res.json();
+        const data = await readJson(res);
         if (!res.ok || data.ok === false) {
           btnHint.textContent = data.error || "Could not turn on";
           return;
         }
+        if (typeof data.auto_reply === "boolean") setAutoReplyUI(data.auto_reply);
         setPowerUI(true);
       } catch (err) {
         btnHint.textContent = String(err);
@@ -894,6 +1140,10 @@ HTML = """<!DOCTYPE html>
       }
       await doStart();
     });
+
+    if (autoReplyBtn) {
+      autoReplyBtn.addEventListener("click", () => { doToggleAuto(); });
+    }
 
     stopBtn.addEventListener("click", async () => {
       if (!powered) {
@@ -916,7 +1166,7 @@ HTML = """<!DOCTYPE html>
       try {
         if (talking) await doStop();
         const res = await fetch("/api/clear", { method: "POST" });
-        const data = await res.json();
+        const data = await readJson(res);
         if (!res.ok || data.ok === false) {
           btnHint.textContent = data.error || "Could not refresh chat";
           return;
@@ -948,7 +1198,7 @@ HTML = """<!DOCTYPE html>
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({ text: pinnedContext.value }),
         });
-        const data = await res.json();
+        const data = await readJson(res);
         if (!res.ok || data.ok === false) {
           contextHint.textContent = data.error || "Could not save context";
           return;
@@ -965,7 +1215,7 @@ HTML = """<!DOCTYPE html>
 
     async function loadPinnedContext() {
       try {
-        const data = await fetch("/api/context").then((r) => r.json());
+        const data = await fetch("/api/context").then((r) => readJson(r));
         if (data && typeof data.text === "string") {
           pinnedContext.value = data.text;
           const n = data.chars || 0;
@@ -1116,26 +1366,91 @@ HTML = """<!DOCTYPE html>
       window.scrollTo({ top: document.body.scrollHeight, behavior: "smooth" });
     }
 
-    async function boot() {
-      await loadDevices();
-      await loadLlmSettings();
-      await loadTtsSettings();
-      await loadPinnedContext();
-      const hist = await fetch("/api/history").then((r) => r.json());
-      for (const ev of hist) addOrUpdate(ev);
+    async function reloadTranscript() {
+      histReady = false;
+      pendingEvents = [];
+      log.innerHTML = "";
+      lastPartialYou = null;
+      lastPartialAgent = null;
+      setLive("");
+      try {
+        const hist = await fetch("/api/history").then((r) => readJson(r));
+        if (Array.isArray(hist)) {
+          for (const ev of hist) addOrUpdate(ev);
+        }
+      } catch (err) {
+        console.warn("Could not load history:", err);
+        btnHint.textContent = String(err);
+      }
+      histReady = true;
+      const queued = pendingEvents.slice();
+      pendingEvents = [];
+      for (const ev of queued) addOrUpdate(ev);
+    }
 
+    async function loadSessionState() {
+      try {
+        const sess = await fetch("/api/session").then((r) => readJson(r));
+        if (sess && typeof sess.auto_reply === "boolean") {
+          setAutoReplyUI(sess.auto_reply);
+        }
+        if (sess && typeof sess.powered === "boolean") {
+          setPowerUI(sess.powered);
+        }
+        if (sess && typeof sess.talking === "boolean") {
+          setTalkingUI(sess.talking);
+        }
+      } catch (err) {
+        console.warn("Could not load session:", err);
+        setAutoReplyUI(false);
+      }
+    }
+
+    function connectWs() {
+      if (
+        ws &&
+        (ws.readyState === WebSocket.OPEN || ws.readyState === WebSocket.CONNECTING)
+      ) {
+        return;
+      }
       const proto = location.protocol === "https:" ? "wss" : "ws";
-      const ws = new WebSocket(proto + "://" + location.host + "/ws");
+      ws = new WebSocket(proto + "://" + location.host + "/ws");
       ws.onopen = () => {
-        statusEl.textContent = "live";
-        statusEl.className = "ok";
+        statusEl.textContent = powered ? "live" : "off";
+        statusEl.className = powered ? "ok" : "";
       };
       ws.onclose = () => {
         statusEl.textContent = "disconnected — reconnecting…";
         statusEl.className = "";
-        setTimeout(boot, 1200);
+        setTimeout(async () => {
+          await loadSessionState();
+          await reloadTranscript();
+          connectWs();
+        }, 1200);
       };
-      ws.onmessage = (m) => addOrUpdate(JSON.parse(m.data));
+      ws.onmessage = (m) => {
+        const ev = parseWsJson(m.data);
+        if (!ev) return;
+        if (!histReady) {
+          pendingEvents.push(ev);
+          return;
+        }
+        addOrUpdate(ev);
+      };
+    }
+
+    async function boot() {
+      if (!bootStarted) {
+        bootStarted = true;
+        await loadDevices();
+        await loadSttSettings();
+        await loadLlmSettings();
+        await loadTtsSettings();
+        await loadPinnedContext();
+      }
+      await loadSessionState();
+      await reloadTranscript();
+      connectWs();
     }
     boot();
   </script>
@@ -1153,15 +1468,19 @@ def create_app(
     on_power_on: Optional[RespondHandler] = None,
     on_power_off: Optional[RespondHandler] = None,
     on_respond: Optional[RespondHandler] = None,
+    set_auto_reply: Optional[AutoReplySetter] = None,
+    get_session: Optional[SessionGetter] = None,
     get_context: Optional[ContextGetter] = None,
     set_context: Optional[ContextSetter] = None,
     get_tts: Optional[TtsGetter] = None,
     set_tts: Optional[TtsSetter] = None,
     get_llm: Optional[LlmGetter] = None,
     set_llm: Optional[LlmSetter] = None,
+    get_stt: Optional[SttGetter] = None,
+    set_stt: Optional[SttSetter] = None,
     get_devices: Optional[Callable[[], dict[str, Any]]] = None,
-    set_input: Optional[Callable[[int], Awaitable[dict[str, Any]]]] = None,
-    set_output: Optional[Callable[[int], Awaitable[dict[str, Any]]]] = None,
+    set_input: Optional[AudioDeviceSetter] = None,
+    set_output: Optional[AudioDeviceSetter] = None,
 ) -> web.Application:
     h = transcript_hub or hub
     start_handler = on_start or on_respond
@@ -1171,140 +1490,303 @@ def create_app(
         return web.Response(text=HTML, content_type="text/html")
 
     async def history(_: web.Request) -> web.Response:
-        return web.json_response(h.snapshot())
+        try:
+            return _json_response(h.snapshot())
+        except Exception as exc:  # noqa: BLE001
+            return _json_response({"ok": False, "error": str(exc)}, status=500)
+
+    async def session_state(_: web.Request) -> web.Response:
+        if get_session is None:
+            return _json_response(
+                {
+                    "ok": True,
+                    "powered": True,
+                    "talking": False,
+                    "auto_reply": False,
+                }
+            )
+        try:
+            return _json_response(await get_session())
+        except Exception as exc:  # noqa: BLE001
+            return _json_response({"ok": False, "error": str(exc)}, status=500)
 
     async def talk_start(_: web.Request) -> web.Response:
         if start_handler is None:
-            return web.json_response(
+            return _json_response(
                 {"ok": False, "error": "Start handler not ready"}, status=503
             )
-        result = await start_handler()
-        ok = result.get("ok") is True or result.get("ok") == "true"
-        return web.json_response(result, status=200 if ok else 409)
+        try:
+            result = await start_handler()
+            if not isinstance(result, dict):
+                return _json_response(
+                    {"ok": False, "error": f"Bad start result type: {type(result).__name__}"},
+                    status=500,
+                )
+            ok = result.get("ok") is True or result.get("ok") == "true"
+            return _json_response(result, status=200 if ok else 409)
+        except Exception as exc:  # noqa: BLE001
+            return _json_response({"ok": False, "error": str(exc)}, status=500)
 
     async def talk_stop(_: web.Request) -> web.Response:
         if on_stop is None:
-            return web.json_response(
+            return _json_response(
                 {"ok": False, "error": "Stop handler not ready"}, status=503
             )
-        result = await on_stop()
-        return web.json_response(result)
+        try:
+            result = await on_stop()
+            return _json_response(result if isinstance(result, dict) else {"ok": True})
+        except Exception as exc:  # noqa: BLE001
+            return _json_response({"ok": False, "error": str(exc)}, status=500)
+
+    async def auto_reply_set(request: web.Request) -> web.Response:
+        if set_auto_reply is None:
+            return _json_response(
+                {"ok": False, "error": "Auto-reply handler not ready"}, status=503
+            )
+        try:
+            body = await request.json()
+        except Exception:  # noqa: BLE001
+            body = {}
+        if not isinstance(body, dict):
+            body = {}
+        raw = body.get("enabled", body.get("auto_reply", True))
+        if isinstance(raw, str):
+            enabled = raw.strip().lower() in ("1", "true", "on", "yes")
+        else:
+            enabled = bool(raw)
+        try:
+            result = await set_auto_reply(enabled)
+            return _json_response(
+                result if isinstance(result, dict) else {"ok": True, "auto_reply": enabled}
+            )
+        except Exception as exc:  # noqa: BLE001
+            return _json_response({"ok": False, "error": str(exc)}, status=500)
 
     async def clear_context(_: web.Request) -> web.Response:
         if on_clear is None:
-            return web.json_response(
+            return _json_response(
                 {"ok": False, "error": "Clear handler not ready"}, status=503
             )
-        result = await on_clear()
-        ok = result.get("ok") is True
-        return web.json_response(result, status=200 if ok else 500)
+        try:
+            result = await on_clear()
+            if not isinstance(result, dict):
+                return _json_response(
+                    {"ok": False, "error": "Bad clear result"}, status=500
+                )
+            ok = result.get("ok") is True
+            return _json_response(result, status=200 if ok else 500)
+        except Exception as exc:  # noqa: BLE001
+            return _json_response({"ok": False, "error": str(exc)}, status=500)
 
     async def power_off(_: web.Request) -> web.Response:
         if on_power_off is None:
-            return web.json_response(
+            return _json_response(
                 {"ok": False, "error": "Power off not ready"}, status=503
             )
-        result = await on_power_off()
-        return web.json_response(result)
+        try:
+            result = await on_power_off()
+            return _json_response(result if isinstance(result, dict) else {"ok": True})
+        except Exception as exc:  # noqa: BLE001
+            return _json_response({"ok": False, "error": str(exc)}, status=500)
 
     async def power_on(_: web.Request) -> web.Response:
         if on_power_on is None:
-            return web.json_response(
+            return _json_response(
                 {"ok": False, "error": "Power on not ready"}, status=503
             )
-        result = await on_power_on()
-        return web.json_response(result)
+        try:
+            result = await on_power_on()
+            return _json_response(result if isinstance(result, dict) else {"ok": True})
+        except Exception as exc:  # noqa: BLE001
+            return _json_response({"ok": False, "error": str(exc)}, status=500)
 
     async def get_pinned(_: web.Request) -> web.Response:
         if get_context is None:
-            return web.json_response(
+            return _json_response(
                 {"ok": False, "error": "Context not ready"}, status=503
             )
-        return web.json_response(await get_context())
+        try:
+            return _json_response(await get_context())
+        except Exception as exc:  # noqa: BLE001
+            return _json_response({"ok": False, "error": str(exc)}, status=500)
 
     async def set_pinned(request: web.Request) -> web.Response:
         if set_context is None:
-            return web.json_response(
+            return _json_response(
                 {"ok": False, "error": "Context not ready"}, status=503
             )
-        body = await request.json()
-        result = await set_context(str(body.get("text") or ""))
-        ok = result.get("ok") is True
-        return web.json_response(result, status=200 if ok else 500)
+        try:
+            body = await request.json()
+            result = await set_context(str(body.get("text") or ""))
+            ok = isinstance(result, dict) and result.get("ok") is True
+            return _json_response(
+                result if isinstance(result, dict) else {"ok": False},
+                status=200 if ok else 500,
+            )
+        except Exception as exc:  # noqa: BLE001
+            return _json_response({"ok": False, "error": str(exc)}, status=500)
 
-    async def get_tts_settings(_: web.Request) -> web.Response:
+    async def get_tts_settings(request: web.Request) -> web.Response:
         if get_tts is None:
-            return web.json_response(
+            return _json_response(
                 {"ok": False, "error": "TTS settings not ready"}, status=503
             )
-        return web.json_response(await get_tts())
+        try:
+            q = (request.rel_url.query.get("refresh_voices") or "").strip().lower()
+            force = q in ("1", "true", "yes")
+            payload = await get_tts(force_refresh_voices=force)
+            if not isinstance(payload, dict):
+                return _json_response(
+                    {"ok": False, "error": f"Bad TTS payload type: {type(payload).__name__}"},
+                    status=500,
+                )
+            return _json_response(payload)
+        except Exception as exc:  # noqa: BLE001
+            return _json_response({"ok": False, "error": str(exc)}, status=500)
 
     async def set_tts_settings(request: web.Request) -> web.Response:
         if set_tts is None:
-            return web.json_response(
+            return _json_response(
                 {"ok": False, "error": "TTS settings not ready"}, status=503
             )
-        body = await request.json()
-        result = await set_tts(
-            backend=body.get("backend"),
-            chatterbox_url=body.get("chatterbox_url"),
-            voice_id=body.get("voice_id"),
-            speed=body.get("speed"),
-            tonality=body.get("tonality"),
-        )
-        ok = result.get("ok") is True
-        return web.json_response(result, status=200 if ok else 400)
+        try:
+            body = await request.json()
+            result = await set_tts(
+                backend=body.get("backend"),
+                chatterbox_url=body.get("chatterbox_url"),
+                voice_id=body.get("voice_id"),
+                speed=body.get("speed"),
+                tonality=body.get("tonality"),
+            )
+            ok = isinstance(result, dict) and result.get("ok") is True
+            return _json_response(
+                result if isinstance(result, dict) else {"ok": False},
+                status=200 if ok else 400,
+            )
+        except Exception as exc:  # noqa: BLE001
+            return _json_response({"ok": False, "error": str(exc)}, status=500)
 
     async def get_llm_settings(_: web.Request) -> web.Response:
         if get_llm is None:
-            return web.json_response(
+            return _json_response(
                 {"ok": False, "error": "LLM settings not ready"}, status=503
             )
-        return web.json_response(await get_llm())
+        try:
+            return _json_response(await get_llm())
+        except Exception as exc:  # noqa: BLE001
+            return _json_response({"ok": False, "error": str(exc)}, status=500)
 
     async def set_llm_settings(request: web.Request) -> web.Response:
         if set_llm is None:
-            return web.json_response(
+            return _json_response(
                 {"ok": False, "error": "LLM settings not ready"}, status=503
             )
-        body = await request.json()
-        result = await set_llm(
-            backend=body.get("backend"),
-            local_url=body.get("local_url"),
-            local_model=body.get("local_model"),
-        )
-        ok = result.get("ok") is True
-        return web.json_response(result, status=200 if ok else 400)
+        try:
+            body = await request.json()
+            result = await set_llm(
+                backend=body.get("backend"),
+                local_url=body.get("local_url"),
+                local_model=body.get("local_model"),
+            )
+            ok = isinstance(result, dict) and result.get("ok") is True
+            return _json_response(
+                result if isinstance(result, dict) else {"ok": False},
+                status=200 if ok else 400,
+            )
+        except Exception as exc:  # noqa: BLE001
+            return _json_response({"ok": False, "error": str(exc)}, status=500)
+
+    async def get_stt_settings(_: web.Request) -> web.Response:
+        if get_stt is None:
+            return _json_response(
+                {"ok": False, "error": "STT settings not ready"}, status=503
+            )
+        try:
+            return _json_response(await get_stt())
+        except Exception as exc:  # noqa: BLE001
+            return _json_response({"ok": False, "error": str(exc)}, status=500)
+
+    async def set_stt_settings(request: web.Request) -> web.Response:
+        if set_stt is None:
+            return _json_response(
+                {"ok": False, "error": "STT settings not ready"}, status=503
+            )
+        try:
+            body = await request.json()
+            confirm = body.get("confirm_cost")
+            confirm_cost = confirm is True or str(confirm).strip().lower() in (
+                "1",
+                "true",
+                "yes",
+            )
+            result = await set_stt(
+                backend=body.get("backend"),
+                confirm_cost=confirm_cost,
+            )
+            ok = isinstance(result, dict) and result.get("ok") is True
+            return _json_response(
+                result if isinstance(result, dict) else {"ok": False},
+                status=200 if ok else 400,
+            )
+        except Exception as exc:  # noqa: BLE001
+            return _json_response({"ok": False, "error": str(exc)}, status=500)
 
     async def respond(request: web.Request) -> web.Response:
         return await talk_start(request)
 
     async def audio_devices(_: web.Request) -> web.Response:
         if get_devices is None:
-            return web.json_response(
+            return _json_response(
                 {"ok": False, "error": "Audio devices not ready"}, status=503
             )
-        return web.json_response(get_devices())
+        try:
+            payload = get_devices()
+            if not isinstance(payload, dict):
+                return _json_response(
+                    {"ok": False, "error": f"Bad devices payload type: {type(payload).__name__}"},
+                    status=500,
+                )
+            return _json_response(payload)
+        except Exception as exc:  # noqa: BLE001
+            return _json_response({"ok": False, "error": str(exc)}, status=500)
 
     async def audio_input(request: web.Request) -> web.Response:
         if set_input is None:
-            return web.json_response(
+            return _json_response(
                 {"ok": False, "error": "Input switch not ready"}, status=503
             )
-        body = await request.json()
-        result = await set_input(int(body.get("device")))
-        ok = result.get("ok") is True
-        return web.json_response(result, status=200 if ok else 400)
+        try:
+            body = await request.json()
+            raw_dev = body.get("device")
+            index = None if raw_dev is None or raw_dev == "" else int(raw_dev)
+            name = body.get("name")
+            result = await set_input(index, name=str(name) if name else None)
+            ok = isinstance(result, dict) and result.get("ok") is True
+            return _json_response(
+                result if isinstance(result, dict) else {"ok": False},
+                status=200 if ok else 400,
+            )
+        except Exception as exc:  # noqa: BLE001
+            return _json_response({"ok": False, "error": str(exc)}, status=500)
 
     async def audio_output(request: web.Request) -> web.Response:
         if set_output is None:
-            return web.json_response(
+            return _json_response(
                 {"ok": False, "error": "Output switch not ready"}, status=503
             )
-        body = await request.json()
-        result = await set_output(int(body.get("device")))
-        ok = result.get("ok") is True
-        return web.json_response(result, status=200 if ok else 400)
+        try:
+            body = await request.json()
+            raw_dev = body.get("device")
+            index = None if raw_dev is None or raw_dev == "" else int(raw_dev)
+            name = body.get("name")
+            result = await set_output(index, name=str(name) if name else None)
+            ok = isinstance(result, dict) and result.get("ok") is True
+            return _json_response(
+                result if isinstance(result, dict) else {"ok": False},
+                status=200 if ok else 400,
+            )
+        except Exception as exc:  # noqa: BLE001
+            return _json_response({"ok": False, "error": str(exc)}, status=500)
 
     async def ws_handler(request: web.Request) -> web.WebSocketResponse:
         ws = web.WebSocketResponse(heartbeat=20)
@@ -1322,8 +1804,10 @@ def create_app(
 
     app.router.add_get("/", index)
     app.router.add_get("/api/history", history)
+    app.router.add_get("/api/session", session_state)
     app.router.add_post("/api/talk/start", talk_start)
     app.router.add_post("/api/talk/stop", talk_stop)
+    app.router.add_post("/api/auto-reply", auto_reply_set)
     app.router.add_post("/api/clear", clear_context)
     app.router.add_post("/api/power/off", power_off)
     app.router.add_post("/api/power/on", power_on)
@@ -1333,6 +1817,8 @@ def create_app(
     app.router.add_post("/api/tts", set_tts_settings)
     app.router.add_get("/api/llm", get_llm_settings)
     app.router.add_post("/api/llm", set_llm_settings)
+    app.router.add_get("/api/stt", get_stt_settings)
+    app.router.add_post("/api/stt", set_stt_settings)
     app.router.add_post("/api/respond", respond)
     app.router.add_get("/api/audio/devices", audio_devices)
     app.router.add_post("/api/audio/input", audio_input)
@@ -1351,15 +1837,19 @@ async def start_ui(
     on_power_on: Optional[RespondHandler] = None,
     on_power_off: Optional[RespondHandler] = None,
     on_respond: Optional[RespondHandler] = None,
+    set_auto_reply: Optional[AutoReplySetter] = None,
+    get_session: Optional[SessionGetter] = None,
     get_context: Optional[ContextGetter] = None,
     set_context: Optional[ContextSetter] = None,
     get_tts: Optional[TtsGetter] = None,
     set_tts: Optional[TtsSetter] = None,
     get_llm: Optional[LlmGetter] = None,
     set_llm: Optional[LlmSetter] = None,
+    get_stt: Optional[SttGetter] = None,
+    set_stt: Optional[SttSetter] = None,
     get_devices: Optional[Callable[[], dict[str, Any]]] = None,
-    set_input: Optional[Callable[[int], Awaitable[dict[str, Any]]]] = None,
-    set_output: Optional[Callable[[int], Awaitable[dict[str, Any]]]] = None,
+    set_input: Optional[AudioDeviceSetter] = None,
+    set_output: Optional[AudioDeviceSetter] = None,
 ) -> web.AppRunner:
     runner = web.AppRunner(
         create_app(
@@ -1369,12 +1859,16 @@ async def start_ui(
             on_power_on=on_power_on,
             on_power_off=on_power_off,
             on_respond=on_respond,
+            set_auto_reply=set_auto_reply,
+            get_session=get_session,
             get_context=get_context,
             set_context=set_context,
             get_tts=get_tts,
             set_tts=set_tts,
             get_llm=get_llm,
             set_llm=set_llm,
+            get_stt=get_stt,
+            set_stt=set_stt,
             get_devices=get_devices,
             set_input=set_input,
             set_output=set_output,

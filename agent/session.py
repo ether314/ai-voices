@@ -9,7 +9,12 @@ from typing import Any, Optional, Union
 
 from cartesia import AsyncCartesia
 
-from agent.audio import MicCapture, SpeakerPlayback, list_audio_devices
+from agent.audio import (
+    MicCapture,
+    SpeakerPlayback,
+    list_audio_devices,
+    resolve_device_choice,
+)
 from agent.expression import (
     join_speech_chunks,
     strip_tags,
@@ -27,11 +32,15 @@ from agent.local_llm import (
 )
 from agent.local_tts import ChatterboxTTS, DEFAULT_CHATTERBOX_URL
 from agent.pinned_context import PinnedContextStore
-from agent.stt import InkSTT
+from agent.local_stt import (
+    LocalWhisperSTT,
+    detect_stt_device,
+    resolve_whisper_model,
+)
+from agent.stt import InkSTT, permit_cloud_stt
 from agent.transcript_hub import TranscriptEvent, hub
 from agent.tts import (
     DEFAULT_VOICE_ID,
-    JOE_VOICE_ID,
     SonicTTS,
     list_cartesia_voices,
     resolve_cartesia_voice_id,
@@ -61,6 +70,7 @@ AUTO_REPLY_COOLDOWN_S = 0.95
 FILLER_AFTER_LLM_WAIT_S = 0.5
 TTS_BACKENDS = ("cartesia", "local")
 LLM_BACKENDS = ("cursor", "local")
+STT_BACKENDS = ("local", "cartesia")
 _DATA_DIR = Path(__file__).resolve().parent.parent / "data"
 _TTS_BACKEND_PATH = _DATA_DIR / "tts_backend.txt"
 _CHATTERBOX_URL_PATH = _DATA_DIR / "chatterbox_url.txt"
@@ -68,6 +78,10 @@ _CARTESIA_VOICE_PATH = _DATA_DIR / "cartesia_voice_id.txt"
 _LLM_BACKEND_PATH = _DATA_DIR / "llm_backend.txt"
 _LOCAL_LLM_URL_PATH = _DATA_DIR / "local_llm_url.txt"
 _LOCAL_LLM_MODEL_PATH = _DATA_DIR / "local_llm_model.txt"
+_STT_BACKEND_PATH = _DATA_DIR / "stt_backend.txt"
+_AUTO_REPLY_PATH = _DATA_DIR / "auto_reply.txt"
+
+STTEngine = Union[InkSTT, LocalWhisperSTT]
 
 VoiceLLM = Union[CursorVoiceLLM, LocalVoiceLLM]
 
@@ -195,6 +209,76 @@ def _save_local_llm_model(model: str) -> None:
     _LOCAL_LLM_MODEL_PATH.write_text(model.strip() + "\n", encoding="utf-8")
 
 
+def _env_truthy(name: str) -> bool:
+    return os.getenv(name, "").strip().lower() in ("1", "true", "yes", "on")
+
+
+def allow_cartesia_stt_env() -> bool:
+    """Hard kill-switch. Cartesia Ink requires ALLOW_CARTESIA_STT=1 in addition to backend=cartesia."""
+    return _env_truthy("ALLOW_CARTESIA_STT")
+
+
+def _load_auto_reply(default: bool = False) -> bool:
+    """Persisted preference; missing file → default OFF."""
+    try:
+        if _AUTO_REPLY_PATH.is_file():
+            raw = _AUTO_REPLY_PATH.read_text(encoding="utf-8").strip().lower()
+            if raw in ("1", "true", "on", "yes"):
+                return True
+            if raw in ("0", "false", "off", "no"):
+                return False
+    except OSError:
+        pass
+    return default
+
+
+def _save_auto_reply(enabled: bool) -> None:
+    try:
+        _DATA_DIR.mkdir(parents=True, exist_ok=True)
+        _AUTO_REPLY_PATH.write_text(
+            ("1" if enabled else "0") + "\n", encoding="utf-8"
+        )
+    except OSError as exc:
+        print(f"[session] could not save auto_reply: {exc}", flush=True)
+
+
+def _load_stt_backend() -> str:
+    env = os.getenv("STT_BACKEND", "").strip().lower()
+    chosen = ""
+    if env in STT_BACKENDS:
+        chosen = env
+    else:
+        try:
+            if _STT_BACKEND_PATH.is_file():
+                val = _STT_BACKEND_PATH.read_text(encoding="utf-8").strip().lower()
+                if val in STT_BACKENDS:
+                    chosen = val
+        except OSError:
+            pass
+    # Default local — avoid Cartesia Ink STT token burn.
+    if not chosen:
+        chosen = "local"
+    # Hard-disable cloud STT unless both backend=cartesia AND ALLOW_CARTESIA_STT=1.
+    if chosen == "cartesia" and not allow_cartesia_stt_env():
+        print(
+            "[stt] REFUSING Cartesia Ink — STT_BACKEND wants cartesia but "
+            "ALLOW_CARTESIA_STT is not set. Forcing local Whisper "
+            "(no Speech-to-Text tokens).",
+            flush=True,
+        )
+        try:
+            _save_stt_backend("local")
+        except OSError:
+            pass
+        return "local"
+    return chosen
+
+
+def _save_stt_backend(backend: str) -> None:
+    _DATA_DIR.mkdir(parents=True, exist_ok=True)
+    _STT_BACKEND_PATH.write_text(backend + "\n", encoding="utf-8")
+
+
 class VoiceSession:
     def __init__(
         self,
@@ -219,13 +303,15 @@ class VoiceSession:
         self._busy = False
         self._talking = False
         self._powered = True
-        self._auto_reply = True
+        # Default OFF; last preference survives restarts via data/auto_reply.txt.
+        self._auto_reply = _load_auto_reply(default=False)
         self._reply_after_busy = False
         self._turn_lock = asyncio.Lock()
         self._pending_turns: asyncio.Queue[str] = asyncio.Queue()
         self._stop = asyncio.Event()
         # Feed/recv death or Turn on after idle-timeout — reopen Ink websocket.
         self._stt_restart = asyncio.Event()
+        self._stt_restart_reason = ""
         self._active_speak_task: asyncio.Task[None] | None = None
         self._cursor_llm: CursorVoiceLLM | None = None
         self._local_llm: LocalVoiceLLM | None = None
@@ -236,6 +322,7 @@ class VoiceSession:
         self._pinned = PinnedContextStore()
         self._tts_backend = _load_tts_backend()
         self._chatterbox_url = _load_chatterbox_url()
+        self._stt_backend = _load_stt_backend()
         self._tts_speed = load_speed(DEFAULT_SPEED)
         self._tts_tonality = load_tonality(DEFAULT_TONALITY)
         self._sonic: SonicTTS | None = None
@@ -246,6 +333,7 @@ class VoiceSession:
         self._echo_gate_until = 0.0
         self._last_auto_start = 0.0
         self._last_partial_at = 0.0
+        self._last_auto_off_hint_at = 0.0
         self._pending_auto_task: asyncio.Task[None] | None = None
         self._turn_confirm_gen = 0
         self._fillers = FillerBank(
@@ -263,6 +351,44 @@ class VoiceSession:
     @property
     def powered(self) -> bool:
         return self._powered
+
+    def _set_auto_reply(self, enabled: bool) -> None:
+        self._auto_reply = bool(enabled)
+        _save_auto_reply(self._auto_reply)
+
+    async def set_auto_reply(self, enabled: bool) -> dict[str, Any]:
+        """UI Auto-reply toggle — persist preference without starting a reply."""
+        was = self._auto_reply
+        self._set_auto_reply(enabled)
+        if not self._auto_reply:
+            self._cancel_pending_auto()
+        if was != self._auto_reply:
+            label = "on" if self._auto_reply else "off"
+            print(f"[session] auto-reply {label} (toggle)", flush=True)
+            await hub.publish(
+                TranscriptEvent(
+                    role="status",
+                    text=(
+                        "AUTO_ON — pause will trigger Joe"
+                        if self._auto_reply
+                        else "AUTO_OFF — enable Auto-reply for pause replies"
+                    ),
+                )
+            )
+        return {
+            "ok": True,
+            "auto_reply": self._auto_reply,
+            "powered": self._powered,
+            "talking": self._talking,
+        }
+
+    async def get_session_state(self) -> dict[str, Any]:
+        return {
+            "ok": True,
+            "powered": self._powered,
+            "talking": self._talking,
+            "auto_reply": self._auto_reply,
+        }
 
     def _listening_blocked(self) -> bool:
         return self._busy or self._speaker.playing or self._turn_lock.locked()
@@ -287,7 +413,7 @@ class VoiceSession:
         if self._talking or self._busy:
             await self.stop_talking(pause_auto=True)
         self._powered = False
-        self._auto_reply = False
+        self._set_auto_reply(False)
         self._mic.set_muted(True)
         await hub.publish(
             TranscriptEvent(
@@ -296,11 +422,12 @@ class VoiceSession:
             )
         )
         print("[session] app turned off (paused)", flush=True)
-        return {"ok": True, "powered": False}
+        return {"ok": True, "powered": False, "auto_reply": False}
 
     def _request_stt_restart(self, reason: str) -> None:
         if self._stop.is_set():
             return
+        self._stt_restart_reason = reason or "restart"
         if not self._stt_restart.is_set():
             print(f"[stt] restart requested ({reason})", flush=True)
         self._stt_restart.set()
@@ -308,9 +435,9 @@ class VoiceSession:
     async def turn_on(self) -> dict[str, str | bool]:
         """Resume listening after a soft power off."""
         self._powered = True
-        self._auto_reply = True
+        # Do not force auto-reply on — keep last preference (usually off after Turn off).
         self._mic.set_muted(False)
-        # Soft-off often idle-timed the Ink socket; force a fresh websocket.
+        # Soft-off often idle-timed the STT socket; force a fresh session.
         self._request_stt_restart("turn-on")
         await hub.publish(
             TranscriptEvent(
@@ -318,8 +445,15 @@ class VoiceSession:
                 text="APP_ON — listening",
             )
         )
-        print("[session] app turned on", flush=True)
-        return {"ok": True, "powered": True}
+        print(
+            f"[session] app turned on (auto_reply={'on' if self._auto_reply else 'off'})",
+            flush=True,
+        )
+        return {
+            "ok": True,
+            "powered": True,
+            "auto_reply": self._auto_reply,
+        }
 
     async def start_talking(self) -> dict[str, str | bool]:
         """Queue a spoken reply (Respond button or auto after other speaker stops)."""
@@ -346,7 +480,8 @@ class VoiceSession:
                 "error": "No transcript or saved context yet.",
             }
 
-        self._auto_reply = True
+        # Respond as Joe enables auto turn-taking until Stop / Turn off.
+        self._set_auto_reply(True)
         was_talking = self._talking
         self._talking = True
         if self._busy:
@@ -368,9 +503,10 @@ class VoiceSession:
             return {
                 "ok": False,
                 "talking": self._talking,
+                "auto_reply": self._auto_reply,
                 "error": "No transcript or saved context yet.",
             }
-        print("[session] reply queued", flush=True)
+        print("[session] reply queued (auto on)", flush=True)
         return {"ok": True, "talking": True, "auto_reply": True}
 
     def _turn_confirm_s(self) -> float:
@@ -478,7 +614,7 @@ class VoiceSession:
         """Stop button: silence now. pause_auto=True until Respond is clicked."""
         print("[session] Stop — cutting audio now", flush=True)
         if pause_auto:
-            self._auto_reply = False
+            self._set_auto_reply(False)
         self._cancel_pending_auto()
         await self._cut_audio()
         await hub.publish(
@@ -578,9 +714,20 @@ class VoiceSession:
             current_output=self._speaker.device,
         )
 
-    async def set_input_device(self, device: int) -> dict[str, str | bool | int]:
+    async def set_input_device(
+        self,
+        device: Optional[int] = None,
+        *,
+        name: Optional[str] = None,
+    ) -> dict[str, str | bool | int]:
+        resolved = resolve_device_choice(kind="input", index=device, name=name)
+        if resolved is None:
+            return {
+                "ok": False,
+                "error": f"No input device matched index={device!r} name={name!r}",
+            }
         try:
-            await self._mic.set_device(int(device))
+            await self._mic.set_device(int(resolved))
         except Exception as exc:  # noqa: BLE001
             return {"ok": False, "error": str(exc)}
         await hub.publish(
@@ -589,11 +736,22 @@ class VoiceSession:
                 text=f"mic {self._mic.device}",
             )
         )
-        return {"ok": True, "device": int(self._mic.device or device)}
+        return {"ok": True, "device": int(self._mic.device or resolved)}
 
-    async def set_output_device(self, device: int) -> dict[str, str | bool | int]:
+    async def set_output_device(
+        self,
+        device: Optional[int] = None,
+        *,
+        name: Optional[str] = None,
+    ) -> dict[str, str | bool | int]:
+        resolved = resolve_device_choice(kind="output", index=device, name=name)
+        if resolved is None:
+            return {
+                "ok": False,
+                "error": f"No output device matched index={device!r} name={name!r}",
+            }
         try:
-            await self._speaker.set_device(int(device))
+            await self._speaker.set_device(int(resolved))
         except Exception as exc:  # noqa: BLE001
             return {"ok": False, "error": str(exc)}
         await hub.publish(
@@ -602,7 +760,7 @@ class VoiceSession:
                 text=f"speakers {self._speaker.device}",
             )
         )
-        return {"ok": True, "device": int(self._speaker.device or device)}
+        return {"ok": True, "device": int(self._speaker.device or resolved)}
 
     def _select_active_llm(self) -> None:
         if self._llm_backend == "local" and self._local_llm is not None:
@@ -623,20 +781,42 @@ class VoiceSession:
         return f"cursor/{self._cursor_runtime()} ({self.cursor_model})"
 
     async def get_llm_settings(self) -> dict[str, Any]:
-        health: dict[str, Any] = {"ok": False, "reachable": False}
-        if self._local_llm is not None:
-            health = await self._local_llm.health()
-        else:
-            probe = LocalVoiceLLM(
-                base_url=self._local_llm_url,
-                model=self._local_llm_model,
-                api_key=os.getenv("LOCAL_LLM_API_KEY", "ollama").strip() or "ollama",
-            )
-            try:
-                health = await probe.health()
-            finally:
-                await probe.close()
         cursor_runtime = self._cursor_runtime()
+        health: dict[str, Any] = {
+            "ok": False,
+            "reachable": False,
+            "skipped": self._llm_backend != "local",
+        }
+        local_models: list[str] = []
+        # Only probe the OpenAI-compatible local API when that backend is active.
+        # Cursor does not need Ollama; probing it just surfaces connection noise.
+        if self._llm_backend == "local":
+            if self._local_llm is not None:
+                health = await self._local_llm.health()
+            else:
+                probe = LocalVoiceLLM(
+                    base_url=self._local_llm_url,
+                    model=self._local_llm_model,
+                    api_key=os.getenv("LOCAL_LLM_API_KEY", "ollama").strip()
+                    or "ollama",
+                )
+                try:
+                    health = await probe.health()
+                finally:
+                    await probe.close()
+            local_models = list(health.get("models") or [])
+            if self._local_llm_model and self._local_llm_model not in local_models:
+                local_models = [self._local_llm_model, *local_models]
+            hint = (
+                f"Local OpenAI-compatible chat at {self._local_llm_url} "
+                "(Ollama / LM Studio). Model list from /v1/models when reachable."
+            )
+        else:
+            if self._local_llm_model:
+                local_models = [self._local_llm_model]
+            hint = (
+                f"Reply model: Cursor ({cursor_runtime}) — {self.cursor_model}"
+            )
         return {
             "ok": True,
             "backend": self._llm_backend,
@@ -654,15 +834,10 @@ class VoiceSession:
             "cursor_runtime": cursor_runtime,
             "local_url": self._local_llm_url,
             "local_model": self._local_llm_model,
+            "local_models": local_models,
             "local_health": health,
             "active_label": self._llm_status_label(),
-            "hint": (
-                "Cursor uses the Cursor SDK local runtime (on this machine; "
-                "CURSOR_RUNTIME=local, never a cloud VM). Local calls an "
-                "OpenAI-compatible chat API (Ollama default "
-                "http://127.0.0.1:11434/v1). Pinned scenario context is injected "
-                "for both."
-            ),
+            "hint": hint,
         }
 
     async def set_llm_settings(
@@ -764,17 +939,19 @@ class VoiceSession:
         else:
             self._tts = self._local_tts
 
-    async def get_tts_settings(self) -> dict[str, Any]:
+    async def get_tts_settings(
+        self, *, force_refresh_voices: bool = False
+    ) -> dict[str, Any]:
         health: dict[str, Any] = {"ok": False, "reachable": False}
         if self._local_tts is not None:
             health = await self._local_tts.health()
         else:
             probe = ChatterboxTTS(base_url=self._chatterbox_url)
             health = await probe.health()
-        voices = await list_cartesia_voices(self.cartesia_api_key)
-        # Ensure Joe stays selectable even if a transient API miss drops him.
-        if not any(v.get("id") == JOE_VOICE_ID for v in voices):
-            voices.insert(0, {"id": JOE_VOICE_ID, "label": "Joe Marazzo"})
+        voices = await list_cartesia_voices(
+            self.cartesia_api_key, force_refresh=force_refresh_voices
+        )
+        # Joe/Jack are pin-to-top only when the API (or cache) already includes them.
         known = {v["id"] for v in voices}
         if self.voice_id not in known:
             voices.insert(
@@ -796,6 +973,8 @@ class VoiceSession:
             ],
             "voice_id": self.voice_id,
             "voices": voices,
+            "voices_count": len(voices),
+            "voices_refreshed": bool(force_refresh_voices),
             "chatterbox_url": self._chatterbox_url,
             "speed": self._tts_speed,
             "tonality": self._tts_tonality,
@@ -932,10 +1111,106 @@ class VoiceSession:
 
         return await self.get_tts_settings()
 
+    def _stt_status_label(self) -> str:
+        if self._stt_backend == "local":
+            return f"local ({resolve_whisper_model()})"
+        return "cartesia (ink-2)"
+
+    async def get_stt_settings(self) -> dict[str, Any]:
+        allow = allow_cartesia_stt_env()
+        stt_device, stt_compute = detect_stt_device()
+        return {
+            "ok": True,
+            "backend": self._stt_backend,
+            "backends": [
+                {
+                    "id": "local",
+                    "label": f"Local Whisper ({resolve_whisper_model()})",
+                },
+                {
+                    "id": "cartesia",
+                    "label": "Cartesia Ink-2 (cloud STT tokens — costs money)",
+                    "requires_allow_env": True,
+                    "allow_env_set": allow,
+                },
+            ],
+            "whisper_model": resolve_whisper_model(),
+            "stt_device": stt_device,
+            "stt_compute_type": stt_compute,
+            "active_label": self._stt_status_label(),
+            "allow_cartesia_stt": allow,
+            "hint": (
+                "Local STT runs faster-whisper on this PC (no Cartesia Ink "
+                "tokens). Detected device: "
+                f"{stt_device}/{stt_compute}. "
+                "Model size is set via STT_WHISPER_MODEL in .env. "
+                "Cartesia Ink is hard-disabled unless ALLOW_CARTESIA_STT=1 "
+                "in .env AND you Apply STT with an explicit cost confirmation."
+            ),
+        }
+
+    async def set_stt_settings(
+        self,
+        *,
+        backend: Optional[str] = None,
+        confirm_cost: bool = False,
+    ) -> dict[str, Any]:
+        if backend is not None:
+            b = backend.strip().lower()
+            if b not in STT_BACKENDS:
+                return {
+                    "ok": False,
+                    "error": f"Unknown STT backend {backend!r}. Use local or cartesia.",
+                }
+            if b == "cartesia":
+                if not allow_cartesia_stt_env():
+                    print(
+                        "[stt] REFUSING switch to Cartesia Ink — set "
+                        "ALLOW_CARTESIA_STT=1 in .env first",
+                        flush=True,
+                    )
+                    return {
+                        "ok": False,
+                        "error": (
+                            "Cartesia STT is hard-disabled. Add ALLOW_CARTESIA_STT=1 "
+                            "to .env, restart the agent, then Apply again with cost confirmation. "
+                            "This bills Speech-to-Text tokens."
+                        ),
+                    }
+                if not confirm_cost:
+                    print(
+                        "[stt] REFUSING switch to Cartesia Ink — missing confirm_cost",
+                        flush=True,
+                    )
+                    return {
+                        "ok": False,
+                        "error": (
+                            "Cartesia Ink bills Speech-to-Text tokens. Confirm in the UI "
+                            "(confirm_cost) before enabling."
+                        ),
+                    }
+            prev = self._stt_backend
+            self._stt_backend = b
+            _save_stt_backend(b)
+            # Latch matches backend so a stray InkSTT construct cannot open WS on local.
+            permit_cloud_stt(b == "cartesia" and allow_cartesia_stt_env())
+            label = self._stt_status_label()
+            await hub.publish(
+                TranscriptEvent(
+                    role="status",
+                    text=f"STT_BACKEND — {label}",
+                )
+            )
+            print(f"[session] STT backend -> {label}", flush=True)
+            if prev != b:
+                self._request_stt_restart("backend-switch")
+        return await self.get_stt_settings()
+
     async def run(self) -> None:
         print(
             "Voice agent ready. Speak near the mic.\n"
-            "Joe auto-replies when the other person stops; Stop pauses auto.\n"
+            "Auto-reply defaults OFF — use the Auto-reply toggle (or Respond as Joe).\n"
+            "Stop turns auto off; pause replies need Auto-reply ON.\n"
             "http://localhost:7860/\n"
             "Ctrl+C to stop.\n",
             flush=True,
@@ -947,9 +1222,7 @@ class VoiceSession:
             )
         )
 
-        async with AsyncCartesia(api_key=self.cartesia_api_key) as cartesia_stt, AsyncCartesia(
-            api_key=self.cartesia_api_key
-        ) as cartesia_tts:
+        async with AsyncCartesia(api_key=self.cartesia_api_key) as cartesia_tts:
             cursor_llm = CursorVoiceLLM(
                 api_key=self.cursor_api_key,
                 model=self.cursor_model,
@@ -975,6 +1248,19 @@ class VoiceSession:
                 TranscriptEvent(
                     role="status",
                     text=f"LLM — {self._llm_status_label()}",
+                )
+            )
+            # Default: forbid Ink. Only the cartesia branch below may re-permit.
+            permit_cloud_stt(False)
+            print(
+                f"STT backend: {self._stt_status_label()} "
+                f"(Cartesia Ink allowed={allow_cartesia_stt_env()})",
+                flush=True,
+            )
+            await hub.publish(
+                TranscriptEvent(
+                    role="status",
+                    text=f"STT — {self._stt_status_label()}",
                 )
             )
 
@@ -1011,6 +1297,20 @@ class VoiceSession:
                 flush=True,
             )
             print(f"Cartesia voice: {voice_label} ({self.voice_id})", flush=True)
+
+            # Preload Whisper before opening the mic so download/warmup
+            # does not starve the capture queue.
+            if self._stt_backend == "local":
+                from agent.local_stt import (
+                    _load_model,
+                    detect_stt_device,
+                    resolve_whisper_model,
+                )
+
+                _dev, _ctype = detect_stt_device()
+                await asyncio.to_thread(
+                    _load_model, resolve_whisper_model(), _dev, _ctype
+                )
 
             last_live_print = 0.0
 
@@ -1079,24 +1379,39 @@ class VoiceSession:
                 if transcript is None or transcript == "" or not transcript.strip():
                     return
                 now = asyncio.get_running_loop().time()
-                if (
-                    self._talking
-                    or self._busy
-                    or self._speaker.playing
-                    or self._mic.muted
-                    or now < self._echo_gate_until
-                ):
+                # Hard echo: Joe is in the speakers / mic muted — do not log as "you".
+                if self._mic.muted or self._speaker.playing:
                     print(
-                        "[session] ignore turn.end during/after Joe playback (echo)",
+                        "[session] ignore turn.end during Joe audio (echo)",
                         flush=True,
                     )
                     return
+                # Always store the finalized utterance in the transcript log.
                 print(f"\n[you] {transcript}", flush=True)
                 await hub.publish(
                     TranscriptEvent(role="you", text=transcript, partial=False)
                 )
-                # Hold for a real pause before auto-reply / filler.
+                # Hold auto-reply while Joe is busy or echo gate is still settling.
+                if self._talking or self._busy or now < self._echo_gate_until:
+                    print(
+                        "[session] logged turn.end; skip auto (busy/echo gate)",
+                        flush=True,
+                    )
+                    return
                 if not self._auto_reply:
+                    print(
+                        "[session] turn.end logged — auto off "
+                        "(enable Auto-reply for pause replies)",
+                        flush=True,
+                    )
+                    if now - self._last_auto_off_hint_at > 8.0:
+                        self._last_auto_off_hint_at = now
+                        await hub.publish(
+                            TranscriptEvent(
+                                role="status",
+                                text="auto off — enable Auto-reply",
+                            )
+                        )
                     return
                 if now - self._last_auto_start < AUTO_REPLY_COOLDOWN_S:
                     return
@@ -1115,12 +1430,6 @@ class VoiceSession:
                 )
                 self._schedule_auto_reply()
 
-            stt = InkSTT(
-                cartesia_stt,
-                on_partial=on_partial,
-                on_turn_end=on_turn_end,
-            )
-
             await self._speaker.start()
             await self._mic.start()
             # Agent is on at boot — capture must not start muted.
@@ -1130,49 +1439,117 @@ class VoiceSession:
             reply_task = asyncio.create_task(
                 self._reply_loop(), name="reply-loop"
             )
+            stt_fail_streak = 0
             try:
                 while not self._stop.is_set():
                     try:
                         self._stt_restart.clear()
-                        async with stt:
-                            feed_task = asyncio.create_task(
-                                self._feed_stt(stt), name="feed-stt"
+                        self._stt_restart_reason = ""
+                        use_cartesia_stt = (
+                            self._stt_backend == "cartesia"
+                            and allow_cartesia_stt_env()
+                        )
+                        active_stt: STTEngine | None = None
+                        if use_cartesia_stt:
+                            # Explicit opt-in only — burns Cartesia Speech-to-Text tokens.
+                            permit_cloud_stt(True)
+                            print(
+                                "[stt] starting Cartesia Ink (BILLS STT TOKENS)",
+                                flush=True,
                             )
-                            stop_wait = asyncio.create_task(
-                                self._stop.wait(), name="stop-wait"
+                            async with AsyncCartesia(
+                                api_key=self.cartesia_api_key
+                            ) as cartesia_stt:
+                                stt = InkSTT(
+                                    cartesia_stt,
+                                    on_partial=on_partial,
+                                    on_turn_end=on_turn_end,
+                                    allow_cloud_stt=True,
+                                )
+                                active_stt = stt
+                                async with stt:
+                                    await self._run_stt_session(stt)
+                        else:
+                            if self._stt_backend == "cartesia":
+                                print(
+                                    "[stt] REFUSING Cartesia Ink mid-run — "
+                                    "ALLOW_CARTESIA_STT missing; falling back to local",
+                                    flush=True,
+                                )
+                                self._stt_backend = "local"
+                                _save_stt_backend("local")
+                            permit_cloud_stt(False)
+                            print(
+                                "[stt] starting local Whisper "
+                                "(Cartesia Ink unreachable)",
+                                flush=True,
                             )
-                            restart_wait = asyncio.create_task(
-                                self._stt_restart.wait(), name="stt-restart-wait"
+                            stt = LocalWhisperSTT(
+                                on_partial=on_partial,
+                                on_turn_end=on_turn_end,
+                                # Stereo Mix: finalize sooner on short pauses.
+                                end_silence_ms=(
+                                    400.0 if self._mic.is_loopback else None
+                                ),
                             )
-                            done, _pending = await asyncio.wait(
-                                {feed_task, stop_wait, restart_wait},
-                                return_when=asyncio.FIRST_COMPLETED,
+                            active_stt = stt
+                            async with stt:
+                                await self._run_stt_session(stt)
+                        if self._stop.is_set():
+                            break
+                        reason = self._stt_restart_reason or "session-ended"
+                        intentional = reason in ("turn-on", "backend-switch")
+                        worker_err = getattr(active_stt, "last_error", None)
+                        if intentional:
+                            stt_fail_streak = 0
+                            print(
+                                f"[stt] restarting ({reason})",
+                                flush=True,
                             )
-                            for task in (stop_wait, restart_wait):
-                                if not task.done():
-                                    task.cancel()
-                            if not feed_task.done():
-                                feed_task.cancel()
-                            await asyncio.gather(
-                                feed_task,
-                                stop_wait,
-                                restart_wait,
-                                return_exceptions=True,
-                            )
-                            if self._stop.is_set():
-                                break
-                            print("[stt] reconnecting websocket...", flush=True)
                             await hub.publish(
                                 TranscriptEvent(
                                     role="status",
-                                    text="STT reconnecting…",
+                                    text="STT restarting…",
                                 )
                             )
-                            await asyncio.sleep(0.35)
+                            await asyncio.sleep(0.25)
+                            continue
+
+                        stt_fail_streak += 1
+                        delay = min(
+                            20.0, 0.75 * (2 ** min(stt_fail_streak - 1, 4))
+                        )
+                        detail = worker_err or reason
+                        msg = (
+                            f"STT dropped ({detail}); retry in {delay:.1f}s"
+                            if stt_fail_streak > 1
+                            else f"STT dropped ({detail}); reconnecting…"
+                        )
+                        print(f"[stt] {msg}", flush=True)
+                        await hub.publish(
+                            TranscriptEvent(
+                                role="error" if stt_fail_streak > 1 else "status",
+                                text=msg,
+                            )
+                        )
+                        try:
+                            await asyncio.wait_for(
+                                self._stop.wait(), timeout=delay
+                            )
+                            break
+                        except asyncio.TimeoutError:
                             continue
                     except Exception as exc:  # noqa: BLE001
+                        stt_fail_streak += 1
                         msg = str(exc)
-                        print(f"[stt] connection failed: {msg}", flush=True)
+                        delay = min(
+                            20.0, 1.0 * (2 ** min(stt_fail_streak - 1, 4))
+                        )
+                        print(
+                            f"[stt] connection failed: {msg} "
+                            f"(retry in {delay:.1f}s)",
+                            flush=True,
+                        )
                         await hub.publish(
                             TranscriptEvent(
                                 role="error",
@@ -1180,7 +1557,9 @@ class VoiceSession:
                             )
                         )
                         try:
-                            await asyncio.wait_for(self._stop.wait(), timeout=8.0)
+                            await asyncio.wait_for(
+                                self._stop.wait(), timeout=delay
+                            )
                             break
                         except asyncio.TimeoutError:
                             print("[stt] retrying connection...", flush=True)
@@ -1202,7 +1581,32 @@ class VoiceSession:
                 self._cursor_llm = None
                 await cursor_llm.close()
 
-    async def _feed_stt(self, stt: InkSTT) -> None:
+    async def _run_stt_session(self, stt: STTEngine) -> None:
+        """Feed mic until stop or restart requested."""
+        feed_task = asyncio.create_task(self._feed_stt(stt), name="feed-stt")
+        stop_wait = asyncio.create_task(self._stop.wait(), name="stop-wait")
+        restart_wait = asyncio.create_task(
+            self._stt_restart.wait(), name="stt-restart-wait"
+        )
+        try:
+            await asyncio.wait(
+                {feed_task, stop_wait, restart_wait},
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+        finally:
+            for task in (stop_wait, restart_wait):
+                if not task.done():
+                    task.cancel()
+            if not feed_task.done():
+                feed_task.cancel()
+            await asyncio.gather(
+                feed_task,
+                stop_wait,
+                restart_wait,
+                return_exceptions=True,
+            )
+
+    async def _feed_stt(self, stt: STTEngine) -> None:
         """Keep STT fed even when TTS/LLM is slow — never block mic forever."""
         failures = 0
         async for chunk in self._mic.chunks():
@@ -1230,6 +1634,7 @@ class VoiceSession:
                     or "idle timeout" in lower
                     or "closed" in lower
                     or "connection" in lower
+                    or "worker stopped" in lower
                 )
                 if fatal:
                     self._request_stt_restart("send-failed")
